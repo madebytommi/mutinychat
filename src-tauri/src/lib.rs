@@ -1,10 +1,11 @@
-use std::path::PathBuf;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::{io::Write, string::String};
 
 use serde_json::json;
+
+const MAX_BACKEND_OUTPUT_LINES: usize = 20;
 
 struct BackendSession {
     child: std::process::Child,
@@ -40,24 +41,18 @@ impl BackendSession {
     }
 
     fn is_running(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
-        }
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn send_command(&mut self, payload: &serde_json::Value) -> Result<String, String> {
-        let line = format!("{}\n", payload);
-        self.stdin
-            .write_all(line.as_bytes())
+        writeln!(self.stdin, "{payload}")
             .map_err(|err| format!("Failed writing JSON command to backend stdin: {err}"))?;
         self.stdin
             .flush()
             .map_err(|err| format!("Failed flushing backend stdin: {err}"))?;
 
         let mut response_line = String::new();
-        loop {
+        for _ in 0..MAX_BACKEND_OUTPUT_LINES {
             response_line.clear();
             let read = self
                 .stdout
@@ -73,14 +68,23 @@ impl BackendSession {
                 continue;
             }
 
-            let parsed = serde_json::from_str::<serde_json::Value>(trimmed);
-            if let Ok(serde_json::Value::Object(map)) = parsed {
-                if map.get("type") == Some(&serde_json::Value::String("received".to_string())) {
-                    continue;
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(serde_json::Value::Object(_)) => return Ok(trimmed.to_string()),
+                Ok(_) => continue,
+                Err(_) => {
+                    eprintln!("Ignoring non-JSON backend output: {trimmed}");
                 }
-                return Ok(trimmed.to_string());
             }
         }
+
+        Err("Backend produced too many invalid output lines".to_string())
+    }
+}
+
+impl Drop for BackendSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -91,41 +95,43 @@ fn backend_session_lock() -> &'static Mutex<Option<BackendSession>> {
 }
 
 #[tauri::command]
-fn backend_ipc(command: String, message: Option<String>, room_name: Option<String>) -> Result<String, String> {
+fn backend_ipc(
+    command: String,
+    message: Option<String>,
+    room_name: Option<String>,
+) -> Result<String, String> {
     run_backend_command(&command, message.as_deref(), room_name.as_deref())
+}
+
+fn push_executable_candidates(candidates: &mut Vec<PathBuf>, root: &Path) {
+    candidates.push(root.join("mutinychat-backend"));
+    candidates.push(root.join("backend/mutinychat-backend"));
+    candidates.push(root.join("backend/dist/mutinychat-backend"));
+    candidates.push(root.join("../backend/dist/mutinychat-backend"));
+
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(root.join("mutinychat-backend.exe"));
+        candidates.push(root.join("backend/mutinychat-backend.exe"));
+        candidates.push(root.join("backend/dist/mutinychat-backend.exe"));
+        candidates.push(root.join("../backend/dist/mutinychat-backend.exe"));
+    }
 }
 
 fn backend_exec_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-
     for root in backend_search_roots() {
-        candidates.push(root.join("mutinychat-backend"));
-        candidates.push(root.join("backend/mutinychat-backend"));
-        candidates.push(root.join("backend/dist/mutinychat-backend"));
-        candidates.push(root.join("../backend/dist/mutinychat-backend"));
+        push_executable_candidates(&mut candidates, &root);
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        for root in backend_search_roots() {
-            candidates.push(root.join("mutinychat-backend.exe"));
-            candidates.push(root.join("backend/mutinychat-backend.exe"));
-            candidates.push(root.join("backend/dist/mutinychat-backend.exe"));
-            candidates.push(root.join("../backend/dist/mutinychat-backend.exe"));
-        }
-    }
-
     candidates
 }
 
 fn backend_script_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-
     for root in backend_search_roots() {
         candidates.push(root.join("backend/main.py"));
         candidates.push(root.join("../backend/main.py"));
     }
-
     candidates
 }
 
@@ -140,54 +146,63 @@ fn backend_search_roots() -> Vec<PathBuf> {
         if let Some(mut dir) = exe_path.parent() {
             for _ in 0..6 {
                 roots.push(dir.to_path_buf());
-                if let Some(parent) = dir.parent() {
-                    dir = parent;
-                } else {
+                let Some(parent) = dir.parent() else {
                     break;
-                }
+                };
+                dir = parent;
             }
         }
     }
 
+    roots.sort();
+    roots.dedup();
     roots
+}
+
+fn python_command(script: PathBuf) -> Command {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut command = Command::new("py");
+        command.arg("-3");
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = Command::new("python3");
+
+    cmd.arg(script);
+    cmd
 }
 
 fn resolve_backend_command() -> Result<Command, String> {
     if cfg!(debug_assertions) {
         for script in backend_script_candidates() {
-            if !script.exists() {
-                continue;
+            if script.exists() {
+                return Ok(python_command(script));
             }
-
-            let mut cmd = Command::new("python3");
-            cmd.arg(script);
-            return Ok(cmd);
         }
     }
 
     for path in backend_exec_candidates() {
-        if !path.exists() {
-            continue;
+        if path.is_file() {
+            return Ok(Command::new(path));
         }
-
-        let cmd = Command::new(&path);
-        return Ok(cmd);
     }
 
     for script in backend_script_candidates() {
-        if !script.exists() {
-            continue;
+        if script.exists() {
+            return Ok(python_command(script));
         }
-
-        let mut cmd = Command::new("python3");
-        cmd.arg(script);
-        return Ok(cmd);
     }
 
-    Err("Backend not found. Expected mutinychat-backend sidecar, backend/dist/mutinychat-backend, or backend/main.py relative to the project or app executable.".to_string())
+    Err("Backend not found. Expected a bundled mutinychat-backend executable or backend/main.py in a development checkout.".to_string())
 }
 
-fn run_backend_command(command: &str, message: Option<&str>, room_name: Option<&str>) -> Result<String, String> {
+fn run_backend_command(
+    command: &str,
+    message: Option<&str>,
+    room_name: Option<&str>,
+) -> Result<String, String> {
     let mut payload = json!({ "cmd": command });
     if let Some(msg) = message {
         payload["message"] = json!(msg);
@@ -216,12 +231,14 @@ fn run_backend_command(command: &str, message: Option<&str>, room_name: Option<&
 
     match session.send_command(&payload) {
         Ok(response) => Ok(response),
-        Err(_) => {
+        Err(first_error) => {
             *guard = Some(BackendSession::start()?);
             let retry_session = guard
                 .as_mut()
                 .ok_or_else(|| "Backend session unavailable after restart".to_string())?;
-            retry_session.send_command(&payload)
+            retry_session.send_command(&payload).map_err(|retry_error| {
+                format!("Backend command failed: {first_error}; retry failed: {retry_error}")
+            })
         }
     }
 }
@@ -232,5 +249,5 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![backend_ipc])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running Tauri application");
 }
