@@ -63,8 +63,22 @@ jobs:
           workspaces: src-tauri
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - name: Run Clippy
+        id: clippy
         shell: bash
         run: |
-          set -o pipefail
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tail -n 160
+          set +e
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          tail -n 160 clippy.log
+          exit 0
+      - name: Upload Clippy diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-diagnostics
+          path: clippy.log
+      - name: Enforce Clippy result
+        if: steps.clippy.outputs.status != '0'
+        run: exit 1
       - run: cargo test --manifest-path src-tauri/Cargo.toml --all-features
