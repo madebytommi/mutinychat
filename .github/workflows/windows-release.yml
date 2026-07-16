@@ -110,7 +110,9 @@ jobs:
 
       - name: Verify packaged runtime and create portable ZIP
         shell: pwsh
-        run: ./scripts/verify-windows-package.ps1
+        run: >-
+          ./scripts/verify-windows-package.ps1
+          -TargetDirectory "src-tauri\target\${{ env.RUST_TARGET }}\release"
 
       - name: Briefly launch packaged application
         shell: pwsh
