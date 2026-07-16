@@ -1,0 +1,158 @@
+name: Windows Build and Release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-release.yml"
+      - "backend/**"
+      - "scripts/**"
+      - "src/**"
+      - "src-tauri/**"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+  RUST_TARGET: x86_64-pc-windows-msvc
+  TOR_BROWSER_VERSION: "15.0.18"
+  TOR_SIGNING_FINGERPRINT: EF6E286DDA85EA2A4BA7DE684E2C6E8793298290
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-windows.lock
+
+      - name: Compile and test backend source
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r backend/requirements-windows.lock
+          python -m compileall -q backend/main.py backend/test_main.py
+          python -m unittest discover -s backend -p "test_*.py" -v
+
+      - name: Build backend sidecar
+        shell: pwsh
+        run: ./scripts/build-backend-sidecar.ps1 -PythonExecutable python
+
+      - name: Ensure GnuPG is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gpg.exe -ErrorAction SilentlyContinue)) {
+            choco install gnupg -y --no-progress
+          }
+          gpg.exe --version
+
+      - name: Download and verify official Tor Expert Bundle
+        shell: pwsh
+        run: >-
+          ./scripts/prepare-tor-windows.ps1
+          -TorBrowserVersion "${{ env.TOR_BROWSER_VERSION }}"
+          -TorSigningFingerprint "${{ env.TOR_SIGNING_FINGERPRINT }}"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Run Rust clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --target ${{ env.RUST_TARGET }} --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ env.RUST_TARGET }} --all-features
+
+      - name: Build Windows installers
+        run: npx tauri build --target ${{ env.RUST_TARGET }} --bundles nsis,msi
+
+      - name: Verify packaged runtime and create portable ZIP
+        shell: pwsh
+        run: >-
+          ./scripts/verify-windows-package.ps1
+          -TargetDirectory "src-tauri\target\${{ env.RUST_TARGET }}\release"
+
+      - name: Briefly launch packaged application
+        shell: pwsh
+        run: |
+          $App = Resolve-Path "src-tauri/target/${{ env.RUST_TARGET }}/release/mutinychat.exe"
+          $Process = Start-Process -FilePath $App -PassThru
+          Start-Sleep -Seconds 8
+          if ($Process.HasExited) {
+            throw "Packaged application exited immediately with code $($Process.ExitCode)"
+          }
+          Stop-Process -Id $Process.Id -Force
+          Get-Process mutinychat-backend, tor -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutinychat-windows-${{ github.sha }}
+          path: artifacts/windows/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mutinychat-windows-${{ github.sha }}
+          path: artifacts/windows
+
+      - name: Publish tagged GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          artifacts/windows/*
+          --repo "${GITHUB_REPOSITORY}"
+          --title "MutinyChat ${GITHUB_REF_NAME}"
+          --generate-notes

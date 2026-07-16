@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build && npm run build:backend:sidecar",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../build"
   },
   "app": {
@@ -26,8 +26,11 @@
     "targets": "all",
     "copyright": "Copyright (c) 2026 MutinyChat",
     "externalBin": [
-      "../backend/dist/mutinychat-backend",
-      "../backend/dist/tor"
+      "../backend/dist/mutinychat-backend"
+    ],
+    "resources": [
+      "resources/tor/",
+      "resources/data/"
     ],
     "icon": [
       "icons/icon.png",
@@ -36,6 +39,14 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "wix": {
+        "language": "en-US"
+      }
+    }
   }
 }

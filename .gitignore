@@ -11,11 +11,20 @@ vite.config.ts.timestamp-*
 
 # Python
 .venv/
+.venv-windows-build/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 backend/build/
 backend/dist/
+
+# Windows packaging
+.tor-windows-build/
+artifacts/
+src-tauri/resources/tor/*
+!src-tauri/resources/tor/.gitkeep
+src-tauri/resources/data/*
+!src-tauri/resources/data/.gitkeep
 
 # Rust / Tauri
 src-tauri/target/

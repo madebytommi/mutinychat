@@ -1,187 +1,199 @@
 # MutinyChat
 
-MutinyChat is a retro-styled desktop chat app (AOL/MSN-inspired) built with Tauri + Svelte + Python.
+MutinyChat is a retro-styled desktop chat app inspired by AOL and MSN, built with Tauri, Svelte, Python, and Tor.
 
-It supports direct room sharing over Tor Hidden Services with ephemeral chat behavior and encrypted message transport in the current implementation.
+It supports direct room sharing over Tor onion services with ephemeral chat behavior and encrypted message transport. This remains an actively developed MVP/prototype, not a professionally audited or production-grade secure messenger.
 
-## Work In Progress
+## Current project status
 
-This project is still a work in progress.
+Implemented:
 
-I know it is still buggy in places, and that is expected right now. I am building this in public as a fun project and improving it over time.
-
-## Current Project Status
-
-This repository is an actively developed MVP/prototype with:
 - Tauri v2 desktop shell
-- Svelte 5 frontend (SPA mode)
-- Python backend sidecar (stdio JSON protocol)
-- Tor integration via `stem`
-- Message encryption via `PyNaCl` (`nacl.secret.SecretBox`)
-- Responsive Bootstrap-based layout with custom retro styling
+- Svelte 5 frontend
+- Python stdio JSON backend
+- Tor onion-service hosting and SOCKS connections through Stem and PySocks
+- PyNaCl public-key session handshake and encrypted messages
+- One host and one guest per room
+- Windows and macOS packaging work
 
-## Implemented Features
+## Windows downloads
 
-- Create room (host)
-- Join room using share link or pasted `.onion` value
-- Automatic random room name generation
-- QR code generation for room sharing
-- Tor startup and status signaling
-- Polling-based message delivery
-- Encrypted message send/receive path once key exchange is established
-- Ephemeral room cleanup behavior (`room_deleted` flow)
-- Retro sound effects toggle
-- Username confirmation and persistence
-- Sender names shown in chat bubbles
-- macOS packaging to `.app` and `.dmg`
+Tagged releases are built by GitHub Actions on `windows-latest` for `x86_64-pc-windows-msvc`.
+
+Release artifacts include:
+
+- An NSIS installer
+- An MSI installer when Tauri produces one successfully
+- A portable Windows ZIP
+- `SHA256SUMS.txt`
+
+The Windows package bundles the compiled MutinyChat application, a self-contained PyInstaller backend, and the official Tor Expert Bundle runtime. End users do not need Python, Tor Browser, Node.js, Rust, Git, or developer tools.
+
+### Unsigned-build warning
+
+Current Windows builds are unsigned. Microsoft Defender SmartScreen may warn that the publisher is unknown. Review the GitHub release, verify the SHA-256 checksum, and make an informed choice. Do not disable antivirus or Windows security protections.
+
+### Installer
+
+Download the NSIS `.exe` from the GitHub Release, verify its checksum, and run it. The installer uses current-user mode and does not require a machine-wide installation.
+
+### Portable ZIP
+
+Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mutinychat-backend.exe`, the `tor` directory, and the `data` directory beside the application.
 
 ## Architecture
 
 ### Frontend
-- SvelteKit + Vite
-- SPA mode (`adapter-static` + `fallback: index.html`, SSR disabled)
-- Bootstrap CSS imported locally from npm (not CDN)
+
+- SvelteKit and Vite
+- SPA mode using `adapter-static`
+- Bootstrap imported from npm
 - Main UI in `src/App.svelte`
 
-### Desktop Shell
+### Desktop shell
+
 - Tauri v2 Rust host in `src-tauri`
-- Frontend loaded from Vite in dev and static `build/` output in release
+- Static frontend assets in production
+- One managed backend process over stdio JSON
+- Release builds resolve the backend and Tor from Tauri's application resource directory
+- Windows child processes are launched without persistent console windows
 
 ### Backend
-- Python process launched by Rust side (`backend/main.py` in dev, compiled sidecar in release)
-- Stdio JSON command protocol (`--stdio-json`)
-- Tor Hidden Service + SOCKS client via `stem` and `PySocks`
-- E2EE key exchange/messages via `PyNaCl`
 
-## Repository Layout
+- Python process in development, compiled PyInstaller sidecar in Windows releases
+- Tor onion services and SOCKS connections through Stem and PySocks
+- PyNaCl `Box` public-key handshake and encrypted messages
+- Runtime Tor data stored in a temporary writable directory and removed during normal shutdown
 
-- `src/` Svelte frontend
-- `backend/` Python backend and sidecar build spec
-- `scripts/build-backend-sidecar.sh` macOS arm64 sidecar rebuild helper
-- `scripts/test-packaged-macos.sh` packaged app smoke helper
-- `src-tauri/` Rust/Tauri application
+## Repository layout
 
-## Requirements
+- `src/` — Svelte frontend
+- `backend/` — Python backend, tests, and dependency files
+- `scripts/build-backend-sidecar.sh` — macOS arm64 sidecar helper
+- `scripts/build-backend-sidecar.ps1` — reproducible Windows PyInstaller build
+- `scripts/prepare-tor-windows.ps1` — official Tor download, signature verification, and resource preparation
+- `scripts/verify-windows-package.ps1` — installer/runtime verification and portable ZIP creation
+- `src-tauri/` — Rust/Tauri application
+- `.github/workflows/ci.yml` — normal Linux validation
+- `.github/workflows/windows-release.yml` — Windows build and tagged-release pipeline
 
-- Node.js + npm
-- Rust toolchain + Cargo
-- Python 3 with a virtual environment at `.venv`
+## Development requirements
 
-Python backend dependencies are listed in `backend/requirements.txt`:
-- `stem`
-- `pynacl`
-- `cryptography`
-- `PySocks`
-
-## Setup
+- Node.js 20 or compatible
+- Rust toolchain and Cargo
+- Python 3.12 recommended
+- Tor installed locally for development room testing
 
 Install frontend dependencies:
 
 ```bash
-npm install
+npm ci
 ```
 
-Create and populate Python environment (example):
+Create a Python environment and install backend dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt pyinstaller
+python -m venv .venv
+python -m pip install -r backend/requirements.txt
 ```
 
-## Development
-
-Run desktop dev mode:
+Run desktop development mode:
 
 ```bash
 npm run tauri dev
 ```
 
-Useful scripts:
+## Windows build process
 
-- `npm run dev` run Vite only
-- `npm run build` build Svelte static output
-- `npm run check` run `svelte-check`
-- `npm run check:watch` watch mode type checks
+Run these commands from a Windows development machine with Node.js, Python, Rust, GnuPG, and Tauri's Windows prerequisites installed:
 
-## Packaging
-
-Create production bundles:
-
-```bash
-npm run tauri build
+```powershell
+npm ci
+npm run check
+npm run build
+npm run build:backend:windows
+npm run prepare:tor:windows
+npx tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi
+npm run verify:package:windows
 ```
 
-Current verified output paths:
-- `src-tauri/target/release/bundle/macos/MutinyChat.app`
-- `src-tauri/target/release/bundle/dmg/MutinyChat_0.1.0_aarch64.dmg`
+The backend build uses pinned packages from `backend/requirements-windows.lock` and produces:
 
-### Packaging Notes
+`backend/dist/mutinychat-backend-x86_64-pc-windows-msvc.exe`
 
-- `tauri build` automatically runs:
-	- `npm run build`
-	- `npm run build:backend:sidecar`
-- `build:backend:sidecar` currently rebuilds only on macOS arm64 and no-ops elsewhere.
-- Tauri bundle config includes external binaries:
-	- `mutinychat-backend`
-	- `tor`
+Tauri strips the target suffix in the packaged runtime and launches `mutinychat-backend.exe` from its resource directory.
 
-## Packaged App Smoke Test (macOS)
+## Tor source and verification
 
-Run:
+The Windows workflow pins the official Tor Project Expert Bundle associated with Tor Browser `15.0.18`:
 
-```bash
-npm run test:packaged:macos
-```
+`tor-expert-bundle-windows-x86_64-15.0.18.tar.gz`
 
-This verifies:
-- `.app` bundle exists
-- bundled backend sidecar exists
-- bundled `tor` binary exists
-- app process starts
+The archive and detached signature are downloaded from the Tor Project archive. The build imports the pinned Tor Browser Developers signing fingerprint:
 
-## Runtime Behavior Summary
+`EF6E286DDA85EA2A4BA7DE684E2C6E8793298290`
 
-- Host creates a room and receives a share link + QR.
-- Guest joins via pasted link/onion.
-- Messages are sent over Tor sockets.
-- Incoming messages are polled by the frontend.
-- Room state and messages are cleaned when room closes/disconnect conditions are met.
+GnuPG must successfully verify the detached signature before packaging continues. The complete Tor executable directory, required DLLs, and GeoIP data are included. The repository does not commit downloaded Tor binaries.
 
-## Troubleshooting
+## GitHub release behavior
 
-### Blank/white window in packaged app
+Pull requests run the Windows build and upload temporary Actions artifacts for review. They do not publish GitHub Releases.
 
-Use local bundled CSS imports (already configured) rather than CDN assets, then rebuild:
+A tag matching `v*`, such as `v0.1.0`, runs the same verified build and publishes the resulting Windows artifacts through GitHub Releases. `SHA256SUMS.txt` is generated from the final files.
 
-```bash
-npm run tauri build
-```
+## Automated Windows checks
 
-### Backend process exited unexpectedly
+The Windows workflow checks:
 
-Rebuild sidecar and package again:
+- Frontend type checking and production build
+- Python compilation and unit tests
+- Self-contained backend CLI ping
+- Backend stdio JSON ping
+- Official Tor signature
+- Tor executable, DLLs, GeoIP data, and version command
+- Rust formatting, Clippy, and tests
+- NSIS installer existence
+- MSI existence when available
+- Packaged application, backend, Tor, and data files
+- Portable ZIP contents
+- Absence of common development caches in the portable ZIP
+- Brief packaged-app launch without immediate termination
 
-```bash
-npm run build:backend:sidecar
-npm run tauri build
-```
+A Tor version check does not prove that a real room can be created or joined.
 
-### Tor startup failure
+## Clean-machine manual test checklist
 
-In dev, ensure Tor is installed or bundled path is valid. The backend checks multiple tor locations and reports friendly errors.
+These steps are required before calling a release fully verified. They are not marked as passed merely because CI succeeds.
 
-### Check recent app logs (macOS)
+1. Use a clean Windows machine or VM without Python or Tor installed.
+2. Download MutinyChat from GitHub Releases without cloning the repository.
+3. Verify the artifact against `SHA256SUMS.txt`.
+4. Install or extract MutinyChat.
+5. Launch it and confirm no console window remains open.
+6. Create a room and confirm a v3 onion address appears.
+7. Join from a second independent installation.
+8. Exchange multiple messages in both directions.
+9. Disconnect and reconnect where supported.
+10. Close both applications and confirm no backend or Tor processes remain.
+11. Confirm temporary Tor directories are cleaned after normal shutdown.
+12. Reboot and launch again.
+13. Uninstall and confirm normal application cleanup.
 
-```bash
-log show --last 5m --predicate 'process contains "tauri-app"' --style compact
-```
+## Known limitations
 
-## Security and Privacy Notes
+- Windows builds are unsigned and may trigger SmartScreen.
+- CI cannot prove two-peer Tor connectivity on separate machines.
+- No user-verifiable safety-number or identity-verification UI exists yet.
+- The cryptographic and networking design has not received an independent professional audit.
+- Unexpected termination may leave temporary Tor data until the operating system cleans its temporary directory.
+- The application remains a two-person prototype rather than a general-purpose group messenger.
 
-- This is a prototype implementation; audit before production use.
-- Encrypted transport is implemented with symmetric key exchange in-session.
-- No central server is used by design.
+## Security and privacy notes
+
+- No central chat server is used by design.
+- Do not treat prototype status as a guarantee of anonymity or security.
+- Do not expose encryption material in logs or bug reports.
+- Code signing can be added later using protected CI secrets; no private signing material belongs in the repository.
 
 ## License
 
