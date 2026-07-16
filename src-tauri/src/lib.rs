@@ -4,8 +4,14 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::json;
+use tauri::Manager;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const MAX_BACKEND_OUTPUT_LINES: usize = 20;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 struct BackendSession {
     child: std::process::Child,
@@ -14,8 +20,10 @@ struct BackendSession {
 }
 
 impl BackendSession {
-    fn start() -> Result<Self, String> {
-        let mut cmd = resolve_backend_command()?;
+    fn start(app: &tauri::AppHandle) -> Result<Self, String> {
+        let mut cmd = resolve_backend_command(app)?;
+        configure_backend_command(app, &mut cmd)?;
+
         let mut child = cmd
             .arg("--stdio-json")
             .stdin(Stdio::piped())
@@ -96,11 +104,12 @@ fn backend_session_lock() -> &'static Mutex<Option<BackendSession>> {
 
 #[tauri::command]
 fn backend_ipc(
+    app: tauri::AppHandle,
     command: String,
     message: Option<String>,
     room_name: Option<String>,
 ) -> Result<String, String> {
-    run_backend_command(&command, message.as_deref(), room_name.as_deref())
+    run_backend_command(&app, &command, message.as_deref(), room_name.as_deref())
 }
 
 fn push_executable_candidates(candidates: &mut Vec<PathBuf>, root: &Path) {
@@ -174,12 +183,74 @@ fn python_command(script: PathBuf) -> Command {
     cmd
 }
 
-fn resolve_backend_command() -> Result<Command, String> {
-    if cfg!(debug_assertions) {
-        for script in backend_script_candidates() {
-            if script.exists() {
-                return Ok(python_command(script));
-            }
+fn resource_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .resource_dir()
+        .map_err(|err| format!("Failed to resolve application resource directory: {err}"))
+}
+
+fn bundled_backend_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let file_name = if cfg!(target_os = "windows") {
+        "mutinychat-backend.exe"
+    } else {
+        "mutinychat-backend"
+    };
+    Ok(resource_dir(app)?.join(file_name))
+}
+
+fn bundled_tor_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let file_name = if cfg!(target_os = "windows") {
+        "tor.exe"
+    } else {
+        "tor"
+    };
+    Ok(resource_dir(app)?.join("tor").join(file_name))
+}
+
+fn configure_backend_command(
+    app: &tauri::AppHandle,
+    command: &mut Command,
+) -> Result<(), String> {
+    let tor_path = bundled_tor_path(app)?;
+    let tor_directory = tor_path
+        .parent()
+        .ok_or_else(|| "Bundled Tor path has no parent directory".to_string())?;
+
+    if tor_path.is_file() {
+        command.env("MUTINYCHAT_TOR_PATH", &tor_path);
+        command.current_dir(tor_directory);
+    } else if !cfg!(debug_assertions) {
+        return Err(format!(
+            "Bundled Tor executable is missing at {}",
+            tor_path.display()
+        ));
+    }
+
+    if !cfg!(debug_assertions) {
+        command.env("MUTINYCHAT_REQUIRE_BUNDLED_TOR", "1");
+    }
+
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    Ok(())
+}
+
+fn resolve_backend_command(app: &tauri::AppHandle) -> Result<Command, String> {
+    if !cfg!(debug_assertions) {
+        let backend_path = bundled_backend_path(app)?;
+        if backend_path.is_file() {
+            return Ok(Command::new(backend_path));
+        }
+        return Err(format!(
+            "Bundled backend executable is missing at {}",
+            backend_path.display()
+        ));
+    }
+
+    for script in backend_script_candidates() {
+        if script.exists() {
+            return Ok(python_command(script));
         }
     }
 
@@ -189,16 +260,11 @@ fn resolve_backend_command() -> Result<Command, String> {
         }
     }
 
-    for script in backend_script_candidates() {
-        if script.exists() {
-            return Ok(python_command(script));
-        }
-    }
-
-    Err("Backend not found. Expected a bundled mutinychat-backend executable or backend/main.py in a development checkout.".to_string())
+    Err("Backend not found. Expected backend/main.py or a local mutinychat-backend executable in a development checkout.".to_string())
 }
 
 fn run_backend_command(
+    app: &tauri::AppHandle,
     command: &str,
     message: Option<&str>,
     room_name: Option<&str>,
@@ -222,7 +288,7 @@ fn run_backend_command(
     };
 
     if needs_restart {
-        *guard = Some(BackendSession::start()?);
+        *guard = Some(BackendSession::start(app)?);
     }
 
     let session = guard
@@ -232,7 +298,7 @@ fn run_backend_command(
     match session.send_command(&payload) {
         Ok(response) => Ok(response),
         Err(first_error) => {
-            *guard = Some(BackendSession::start()?);
+            *guard = Some(BackendSession::start(app)?);
             let retry_session = guard
                 .as_mut()
                 .ok_or_else(|| "Backend session unavailable after restart".to_string())?;
