@@ -61,6 +61,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Create CI-only sidecar placeholders
+        shell: bash
+        run: |
+          mkdir -p backend/dist
+          touch backend/dist/mutinychat-backend-x86_64-unknown-linux-gnu
+          touch backend/dist/tor-x86_64-unknown-linux-gnu
+          chmod +x backend/dist/mutinychat-backend-x86_64-unknown-linux-gnu
+          chmod +x backend/dist/tor-x86_64-unknown-linux-gnu
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - name: Run Clippy
         id: clippy
