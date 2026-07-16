@@ -1,7 +1,6 @@
 import base64
 import json
 import socket
-import threading
 import unittest
 from unittest import mock
 
@@ -107,7 +106,7 @@ class BackendTestCase(unittest.TestCase):
                 }
             ).encode("utf-8")
             self.assertTrue(backend._process_peer_frame(left, frame))
-            self.assertTrue(backend.handshake_ready_event.is_set())
+            self.assertTrue(backend.handshake_event.is_set())
             self.assertIsNotNone(backend._box)
         finally:
             left.close()
@@ -140,7 +139,7 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual({"status": "closed"}, backend.close_room())
         self.assertIsNone(backend.active_peer_socket)
         self.assertIsNone(backend.tor_controller)
-        self.assertFalse(backend.handshake_ready_event.is_set())
+        self.assertFalse(backend.handshake_event.is_set())
 
     def test_poll_messages_drains_queue(self):
         backend._queue_frontend_message("one")
