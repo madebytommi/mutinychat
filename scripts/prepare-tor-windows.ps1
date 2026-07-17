@@ -93,11 +93,16 @@ foreach ($GeoIpFile in @("geoip", "geoip6")) {
 
 $Dlls = @(Get-ChildItem -LiteralPath $TorDestination -Filter "*.dll" -File)
 if ($Dlls.Count -eq 0) {
-    throw "Prepared Tor runtime contains no DLLs; refusing to package an incomplete runtime"
+    Write-Host "[INFO] Tor bundle contains no adjacent DLLs; validating the self-contained executable directly."
+} else {
+    Write-Host "[INFO] Tor bundle includes $($Dlls.Count) adjacent DLL file(s)."
 }
 
 $VersionOutput = (& $BundledTor --version | Out-String).Trim()
 Assert-LastExitCode "Bundled Tor version smoke test"
+if ([string]::IsNullOrWhiteSpace($VersionOutput) -or $VersionOutput -notmatch "Tor version") {
+    throw "Bundled Tor executable returned an unexpected version response: $VersionOutput"
+}
 Write-Host "[OK] $VersionOutput"
 Write-Host "[OK] Verified source: $ArchiveUrl"
 Write-Host "[OK] Signing fingerprint: $TorSigningFingerprint"
