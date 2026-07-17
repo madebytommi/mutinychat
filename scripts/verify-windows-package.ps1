@@ -10,6 +10,9 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Target = Join-Path $Root $TargetDirectory
 $Output = Join-Path $Root $OutputDirectory
 $PortableRoot = Join-Path $Output "MutinyChat-portable"
+$ResourceRoot = Join-Path $Root "src-tauri\resources"
+$PreparedTorDirectory = Join-Path $ResourceRoot "tor"
+$PreparedDataDirectory = Join-Path $ResourceRoot "data"
 
 function Require-File([string]$Path, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -17,19 +20,44 @@ function Require-File([string]$Path, [string]$Label) {
     }
 }
 
+function Stage-Directory([string]$Source, [string]$Destination, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+        throw "$Label source directory is missing: $Source"
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+}
+
 $AppExe = Join-Path $Target "mutinychat.exe"
 $BackendExe = Join-Path $Target "mutinychat-backend.exe"
-$TorExe = Join-Path $Target "tor\tor.exe"
-$GeoIp = Join-Path $Target "data\geoip"
-$GeoIp6 = Join-Path $Target "data\geoip6"
+$PreparedTorExe = Join-Path $PreparedTorDirectory "tor.exe"
+$PreparedGeoIp = Join-Path $PreparedDataDirectory "geoip"
+$PreparedGeoIp6 = Join-Path $PreparedDataDirectory "geoip6"
 
 Require-File $AppExe "Tauri executable"
 Require-File $BackendExe "Backend sidecar"
-Require-File $TorExe "Bundled Tor executable"
-Require-File $GeoIp "Tor geoip data"
-Require-File $GeoIp6 "Tor geoip6 data"
+Require-File $PreparedTorExe "Prepared Tor executable"
+Require-File $PreparedGeoIp "Prepared Tor geoip data"
+Require-File $PreparedGeoIp6 "Prepared Tor geoip6 data"
 
-$Dlls = @(Get-ChildItem -LiteralPath (Split-Path $TorExe) -Filter "*.dll" -File)
+# Tauri consumes resources/tor and resources/data when creating installers, but the raw
+# target/release directory is not a complete portable layout. Stage those verified
+# resources beside the raw executable for the portable ZIP and launch smoke test.
+$TargetTorDirectory = Join-Path $Target "tor"
+$TargetDataDirectory = Join-Path $Target "data"
+Stage-Directory $PreparedTorDirectory $TargetTorDirectory "Prepared Tor runtime"
+Stage-Directory $PreparedDataDirectory $TargetDataDirectory "Prepared Tor data"
+
+$TorExe = Join-Path $TargetTorDirectory "tor.exe"
+$GeoIp = Join-Path $TargetDataDirectory "geoip"
+$GeoIp6 = Join-Path $TargetDataDirectory "geoip6"
+Require-File $TorExe "Staged Tor executable"
+Require-File $GeoIp "Staged Tor geoip data"
+Require-File $GeoIp6 "Staged Tor geoip6 data"
+
+$Dlls = @(Get-ChildItem -LiteralPath $TargetTorDirectory -Filter "*.dll" -File)
 if ($Dlls.Count -eq 0) {
     Write-Host "[INFO] Packaged Tor runtime has no adjacent DLLs; validating tor.exe directly."
 } else {
@@ -64,8 +92,22 @@ if (Test-Path -LiteralPath $Output) {
 New-Item -ItemType Directory -Path $PortableRoot -Force | Out-Null
 Copy-Item -LiteralPath $AppExe -Destination $PortableRoot
 Copy-Item -LiteralPath $BackendExe -Destination $PortableRoot
-Copy-Item -LiteralPath (Join-Path $Target "tor") -Destination $PortableRoot -Recurse
-Copy-Item -LiteralPath (Join-Path $Target "data") -Destination $PortableRoot -Recurse
+Copy-Item -LiteralPath $TargetTorDirectory -Destination $PortableRoot -Recurse
+Copy-Item -LiteralPath $TargetDataDirectory -Destination $PortableRoot -Recurse
+
+$PortableTorExe = Join-Path $PortableRoot "tor\tor.exe"
+$PortableBackendExe = Join-Path $PortableRoot "mutinychat-backend.exe"
+Require-File $PortableTorExe "Portable Tor executable"
+Require-File $PortableBackendExe "Portable backend sidecar"
+
+$PortablePing = (& $PortableBackendExe --command ping | Out-String).Trim() | ConvertFrom-Json
+if ($PortablePing.status -ne "MutinyChat backend alive") {
+    throw "Portable backend ping returned an unexpected response"
+}
+$PortableTorVersion = (& $PortableTorExe --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $PortableTorVersion -notmatch "Tor version") {
+    throw "Portable Tor version smoke test failed"
+}
 
 $Forbidden = @(".venv", ".venv-windows-build", "__pycache__", "target\debug", "backend\build")
 foreach ($Pattern in $Forbidden) {
