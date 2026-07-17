@@ -31,17 +31,23 @@ Require-File $GeoIp6 "Tor geoip6 data"
 
 $Dlls = @(Get-ChildItem -LiteralPath (Split-Path $TorExe) -Filter "*.dll" -File)
 if ($Dlls.Count -eq 0) {
-    throw "Packaged Tor runtime contains no DLL files"
+    Write-Host "[INFO] Packaged Tor runtime has no adjacent DLLs; validating tor.exe directly."
+} else {
+    Write-Host "[INFO] Packaged Tor runtime includes $($Dlls.Count) adjacent DLL file(s)."
 }
 
 $Ping = (& $BackendExe --command ping | Out-String).Trim() | ConvertFrom-Json
 if ($Ping.status -ne "MutinyChat backend alive") {
     throw "Packaged backend ping returned an unexpected response"
 }
-& $TorExe --version | Out-Host
+$TorVersion = (& $TorExe --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "Packaged Tor version smoke test failed"
 }
+if ([string]::IsNullOrWhiteSpace($TorVersion) -or $TorVersion -notmatch "Tor version") {
+    throw "Packaged Tor executable returned an unexpected version response: $TorVersion"
+}
+Write-Host $TorVersion
 
 $Nsis = @(Get-ChildItem -LiteralPath (Join-Path $Target "bundle\nsis") -Filter "*.exe" -File -ErrorAction SilentlyContinue)
 if ($Nsis.Count -eq 0) {
