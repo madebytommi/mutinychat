@@ -207,10 +207,7 @@ fn bundled_tor_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(resource_dir(app)?.join("tor").join(file_name))
 }
 
-fn configure_backend_command(
-    app: &tauri::AppHandle,
-    command: &mut Command,
-) -> Result<(), String> {
+fn configure_backend_command(app: &tauri::AppHandle, command: &mut Command) -> Result<(), String> {
     let tor_path = bundled_tor_path(app)?;
     let tor_directory = tor_path
         .parent()
