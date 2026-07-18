@@ -52,6 +52,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Reject external frontend runtime resources
+        run: npm run check:frontend-network
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
