@@ -1,0 +1,38 @@
+name: Apply C1 frontend audio patch
+
+on:
+  push:
+    branches:
+      - chatgpt/remove-clearnet-audio
+    paths:
+      - ".github/workflows/c1-apply-audio.yml"
+      - "scripts/apply-c1-audio-patch.mjs"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repair branch
+        uses: actions/checkout@v4
+        with:
+          ref: chatgpt/remove-clearnet-audio
+          fetch-depth: 0
+
+      - name: Apply exact frontend patch
+        run: node scripts/apply-c1-audio-patch.mjs
+
+      - name: Remove one-shot patch machinery
+        run: |
+          rm scripts/apply-c1-audio-patch.mjs
+          rm .github/workflows/c1-apply-audio.yml
+
+      - name: Commit patched frontend
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/App.svelte scripts/apply-c1-audio-patch.mjs .github/workflows/c1-apply-audio.yml
+          git commit -m "Remove clearnet audio requests"
+          git push origin HEAD:chatgpt/remove-clearnet-audio
