@@ -20,8 +20,12 @@ const RUNTIME_EXTENSIONS = new Set([
 const REVIEWED_NON_NETWORK_URIS = new Set([
   "http://www.w3.org/1998/Math/MathML",
   "http://www.w3.org/1999/xhtml",
+  "http://www.w3.org/1999/xlink",
   "http://www.w3.org/2000/svg"
 ]);
+
+// Svelte embeds these strings in local error messages. It does not fetch them.
+const REVIEWED_NON_NETWORK_PREFIXES = ["https://svelte.dev/e/"];
 
 const URL_PATTERN = /https?:\/\/[^\s"'`()<>]+/giu;
 const forbiddenHosts = ["mixkit.co", "assets.mixkit.co"];
@@ -38,6 +42,41 @@ function isMissingPathError(error) {
       typeof error === "object" &&
       "code" in error &&
       error.code === "ENOENT"
+  );
+}
+
+/**
+ * Removes comments because comment-only license and documentation links cannot
+ * initiate runtime requests. String literals and executable code remain scanned.
+ *
+ * @param {string} text
+ * @param {string} extension
+ * @returns {string}
+ */
+function removeNonExecutableComments(text, extension) {
+  let scanned = text;
+
+  if ([".css", ".js", ".mjs", ".svelte", ".ts"].includes(extension)) {
+    scanned = scanned.replace(/\/\*[\s\S]*?\*\//gu, "");
+  }
+  if ([".html", ".svelte", ".svg"].includes(extension)) {
+    scanned = scanned.replace(/<!--[\s\S]*?-->/gu, "");
+  }
+  if ([".js", ".mjs", ".svelte", ".ts"].includes(extension)) {
+    scanned = scanned.replace(/^\s*\/\/.*$/gmu, "");
+  }
+
+  return scanned;
+}
+
+/**
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isReviewedNonNetworkLiteral(url) {
+  return (
+    REVIEWED_NON_NETWORK_URIS.has(url) ||
+    REVIEWED_NON_NETWORK_PREFIXES.some((prefix) => url.startsWith(prefix))
   );
 }
 
@@ -79,18 +118,20 @@ for (const relativeRoot of SCAN_ROOTS) {
   }
 
   for (const file of await walk(absoluteRoot)) {
-    const text = await readFile(file, "utf8");
+    const originalText = await readFile(file, "utf8");
     const relativeFile = path.relative(ROOT, file);
+    const extension = path.extname(file);
+    const executableText = removeNonExecutableComments(originalText, extension);
 
     for (const host of forbiddenHosts) {
-      if (text.toLowerCase().includes(host)) {
+      if (originalText.toLowerCase().includes(host)) {
         findings.push(`${relativeFile}: forbidden runtime host reference: ${host}`);
       }
     }
 
-    for (const match of text.matchAll(URL_PATTERN)) {
+    for (const match of executableText.matchAll(URL_PATTERN)) {
       const rawUrl = match[0].replace(/[),.;]+$/u, "");
-      if (REVIEWED_NON_NETWORK_URIS.has(rawUrl)) continue;
+      if (isReviewedNonNetworkLiteral(rawUrl)) continue;
       findings.push(`${relativeFile}: unexpected external runtime URL: ${rawUrl}`);
     }
   }
