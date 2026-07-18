@@ -10,6 +10,7 @@ Implemented:
 
 - Tauri v2 desktop shell
 - Svelte 5 frontend
+- Locally synthesized retro sound effects with no third-party audio requests
 - Python stdio JSON backend
 - Tor onion-service hosting and SOCKS connections through Stem and PySocks
 - PyNaCl public-key session handshake and encrypted messages
@@ -49,6 +50,8 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - SPA mode using `adapter-static`
 - Bootstrap imported from npm
 - Main UI in `src/App.svelte`
+- Retro notification sounds synthesized locally with the Web Audio API
+- No sound-effect file or third-party sound service is loaded at runtime
 
 ### Desktop shell
 
@@ -71,6 +74,7 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - `backend/` — Python backend, tests, and dependency files
 - `scripts/build-backend-sidecar.sh` — macOS arm64 sidecar helper
 - `scripts/build-backend-sidecar.ps1` — reproducible Windows PyInstaller build
+- `scripts/check-frontend-network-resources.mjs` — rejects unexpected external URLs in frontend runtime files
 - `scripts/prepare-tor-windows.ps1` — official Tor download, signature verification, and resource preparation
 - `scripts/verify-windows-package.ps1` — installer/runtime verification and portable ZIP creation
 - `src-tauri/` — Rust/Tauri application
@@ -111,11 +115,14 @@ Run these commands from a Windows development machine with Node.js, Python, Rust
 npm ci
 npm run check
 npm run build
+npm run check:frontend-network
 npm run build:backend:windows
 npm run prepare:tor:windows
 npx tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi
 npm run verify:package:windows
 ```
+
+The frontend privacy check inspects runtime frontend source, static assets, and compiled output. It rejects unexpected `http://` or `https://` resources so third-party audio, fonts, images, scripts, and styles cannot be silently reintroduced.
 
 The backend build uses pinned packages from `backend/requirements-windows.lock` and produces:
 
@@ -146,6 +153,7 @@ A tag matching `v*`, such as `v0.1.0`, runs the same verified build and publishe
 The Windows workflow checks:
 
 - Frontend type checking and production build
+- Absence of unexpected external frontend runtime resources
 - Python compilation and unit tests
 - Self-contained backend CLI ping
 - Backend stdio JSON ping
@@ -170,14 +178,15 @@ These steps are required before calling a release fully verified. They are not m
 3. Verify the artifact against `SHA256SUMS.txt`.
 4. Install or extract MutinyChat.
 5. Launch it and confirm no console window remains open.
-6. Create a room and confirm a v3 onion address appears.
-7. Join from a second independent installation.
-8. Exchange multiple messages in both directions.
-9. Disconnect and reconnect where supported.
-10. Close both applications and confirm no backend or Tor processes remain.
-11. Confirm temporary Tor directories are cleaned after normal shutdown.
-12. Reboot and launch again.
-13. Uninstall and confirm normal application cleanup.
+6. Confirm retro sounds work while the machine is offline and make no third-party asset request.
+7. Create a room and confirm a v3 onion address appears.
+8. Join from a second independent installation.
+9. Exchange multiple messages in both directions.
+10. Disconnect and reconnect where supported.
+11. Close both applications and confirm no backend or Tor processes remain.
+12. Confirm temporary Tor directories are cleaned after normal shutdown.
+13. Reboot and launch again.
+14. Uninstall and confirm normal application cleanup.
 
 ## Known limitations
 
@@ -191,6 +200,8 @@ These steps are required before calling a release fully verified. They are not m
 ## Security and privacy notes
 
 - No central chat server is used by design.
+- Retro sound effects are generated locally; MutinyChat does not load sound effects from Mixkit or another third-party service.
+- Removing third-party sound requests does not mean every application network flow is automatically protected by Tor.
 - Do not treat prototype status as a guarantee of anonymity or security.
 - Do not expose encryption material in logs or bug reports.
 - Code signing can be added later using protected CI secrets; no private signing material belongs in the repository.
