@@ -1,10 +1,15 @@
+/** @typedef {{ frequency: number, start: number, duration: number, volume: number, type?: OscillatorType, endFrequency?: number }} ToneOptions */
+
+/** @type {AudioContext | null} */
 let audioContext = null;
 
+/** @returns {typeof AudioContext | null} */
 function getAudioContextConstructor() {
   if (typeof window === "undefined") return null;
-  return window.AudioContext || window.webkitAudioContext || null;
+  return window.AudioContext || null;
 }
 
+/** @returns {Promise<AudioContext | null>} */
 async function getReadyAudioContext() {
   const AudioContextConstructor = getAudioContextConstructor();
   if (!AudioContextConstructor) return null;
@@ -20,6 +25,10 @@ async function getReadyAudioContext() {
   return audioContext;
 }
 
+/**
+ * @param {AudioContext} context
+ * @param {ToneOptions} options
+ */
 function scheduleTone(context, options) {
   const {
     frequency,
@@ -53,6 +62,7 @@ function scheduleTone(context, options) {
  * No audio files are loaded and no network request is made.
  *
  * @param {"ding" | "door"} kind
+ * @returns {Promise<void>}
  */
 export async function playRetroTone(kind) {
   const context = await getReadyAudioContext();
@@ -98,6 +108,7 @@ export async function playRetroTone(kind) {
   });
 }
 
+/** @returns {Promise<void>} */
 export async function closeRetroAudio() {
   const context = audioContext;
   audioContext = null;
