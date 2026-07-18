@@ -1,9 +1,10 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
 const ROOT = process.cwd();
 const SCAN_ROOTS = ["src", "static", "build"];
+const REPORT_PATH = path.join(ROOT, "artifacts", "frontend-network-report.txt");
 const RUNTIME_EXTENSIONS = new Set([
   ".css",
   ".html",
@@ -95,12 +96,22 @@ for (const relativeRoot of SCAN_ROOTS) {
   }
 }
 
-if (findings.length > 0) {
-  console.error("Frontend privacy check failed. Runtime frontend files must not load external origins.");
-  for (const finding of [...new Set(findings)].sort()) {
-    console.error(`- ${finding}`);
-  }
+const uniqueFindings = [...new Set(findings)].sort();
+await mkdir(path.dirname(REPORT_PATH), { recursive: true });
+
+if (uniqueFindings.length > 0) {
+  const report = [
+    "Frontend privacy check failed.",
+    "Runtime frontend files must not load unexpected external origins.",
+    "",
+    ...uniqueFindings.map((finding) => `- ${finding}`),
+    ""
+  ].join("\n");
+  await writeFile(REPORT_PATH, report, "utf8");
+  console.error(report);
   process.exit(1);
 }
 
-console.log("Frontend privacy check passed: no unexpected external runtime URLs were found.");
+const successMessage = "Frontend privacy check passed: no unexpected external runtime URLs were found.";
+await writeFile(REPORT_PATH, `${successMessage}\n`, "utf8");
+console.log(successMessage);
