@@ -24,17 +24,36 @@ const REVIEWED_NON_NETWORK_URIS = new Set([
 
 const URL_PATTERN = /https?:\/\/[^\s"'`()<>]+/giu;
 const forbiddenHosts = ["mixkit.co", "assets.mixkit.co"];
+/** @type {string[]} */
 const findings = [];
 
+/**
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isMissingPathError(error) {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ENOENT"
+  );
+}
+
+/**
+ * @param {string} directory
+ * @returns {Promise<string[]>}
+ */
 async function walk(directory) {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
-    if (error?.code === "ENOENT") return [];
+    if (isMissingPathError(error)) return [];
     throw error;
   }
 
+  /** @type {string[]} */
   const files = [];
   for (const entry of entries) {
     const fullPath = path.join(directory, entry.name);
@@ -54,7 +73,7 @@ for (const relativeRoot of SCAN_ROOTS) {
   try {
     if (!(await stat(absoluteRoot)).isDirectory()) continue;
   } catch (error) {
-    if (error?.code === "ENOENT") continue;
+    if (isMissingPathError(error)) continue;
     throw error;
   }
 
