@@ -1,6 +1,7 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
 
@@ -38,12 +39,6 @@
 
   const RETRO_SOUND_PREF_KEY = "mutinychat-retro-sounds-enabled";
   const USERNAME_PREF_KEY = "mutinychat-username";
-  const DING_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/933/933-preview.mp3";
-  const DOOR_SOUND_URL = "https://assets.mixkit.co/active_storage/sfx/2867/2867-preview.mp3";
-  /** @type {HTMLAudioElement | null} */
-  let dingAudio = null;
-  /** @type {HTMLAudioElement | null} */
-  let doorAudio = null;
 
   /** @param {string} message */
   function showToast(message) {
@@ -357,14 +352,8 @@
       return;
     }
 
-    const audio = kind === "door" ? doorAudio : dingAudio;
-    if (!audio) {
-      return;
-    }
-
-    audio.currentTime = 0;
-    void audio.play().catch(() => {
-      // Browser may block autoplay before any user interaction.
+    void playRetroTone(kind).catch(() => {
+      // Audio is optional and must never interrupt chat behavior.
     });
   }
 
@@ -468,10 +457,6 @@
       // Ignore localStorage availability issues.
     }
 
-    dingAudio = new Audio(DING_SOUND_URL);
-    dingAudio.volume = 0.45;
-    doorAudio = new Audio(DOOR_SOUND_URL);
-    doorAudio.volume = 0.4;
     const pollMessages = async () => {
       if (isPolling) return;
       isPolling = true;
@@ -525,8 +510,9 @@
       if (pollTimer !== null) {
         window.clearInterval(pollTimer);
       }
-      dingAudio = null;
-      doorAudio = null;
+      void closeRetroAudio().catch(() => {
+        // Audio cleanup is best-effort during component teardown.
+      });
     };
   });
 
