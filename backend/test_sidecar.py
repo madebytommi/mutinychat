@@ -24,6 +24,7 @@ class SidecarHandshakeTestCase(unittest.TestCase):
     def setUp(self):
         backend.close_room()
         backend._reset_crypto()
+        backend.stop_event.clear()
 
     def tearDown(self):
         backend.close_room()
