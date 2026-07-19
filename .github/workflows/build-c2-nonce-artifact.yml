@@ -1,0 +1,35 @@
+name: Build C2 nonce binding patch
+
+on:
+  push:
+    branches:
+      - chatgpt/authenticate-participants
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply fresh nonce binding in temporary workspace
+        run: python scripts/apply-c2-nonce-binding.py
+      - name: Compile generated backend files
+        run: python -m compileall -q backend
+      - name: Upload generated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2-nonce-bound-files-${{ github.sha }}
+          path: |
+            backend/main.py
+            backend/test_main.py
+            backend/test_participant_handshake.py
+          if-no-files-found: error
+          retention-days: 2
