@@ -6,9 +6,11 @@ import atexit
 import base64
 import binascii
 import json
+import hmac
 import os
 import random
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -16,6 +18,16 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional
+
+from participant_auth import (
+    HANDSHAKE_NONCE_BYTES,
+    PROTOCOL_VERSION,
+    build_confirmation_payload,
+    build_invite,
+    derive_safety_code,
+    parse_invite,
+    validate_confirmation_payload,
+)
 
 import nacl.exceptions
 from nacl.public import Box, PrivateKey, PublicKey
@@ -35,6 +47,7 @@ send_lock = threading.Lock()
 inbox_lock = threading.Lock()
 stop_event = threading.Event()
 handshake_event = threading.Event()
+verification_event = threading.Event()
 
 tor_controller: Optional[Controller] = None
 tor_process: Any = None
@@ -47,7 +60,11 @@ guest_socket: Optional[socket.socket] = None
 active_peer_socket: Optional[socket.socket] = None
 _tor_data_dir: Optional[str] = None
 _private_key: Optional[PrivateKey] = None
+_peer_public_key: Optional[bytes] = None
 _box: Optional[Box] = None
+_verification_code: Optional[str] = None
+_verification_local_confirmed = False
+_verification_peer_confirmed = False
 _peer_count = 0
 _active_room: Optional[dict[str, Any]] = None
 _connection_mode: Optional[str] = None
@@ -87,6 +104,10 @@ def _friendly_error(exc: Exception) -> str:
         return "Tor failed to start. Please try again."
     if "no valid .onion" in lowered:
         return "Invalid share link. Paste the complete MutinyChat room link."
+    if "invitation" in lowered or "host key" in lowered or "protocol version" in lowered:
+        return message or "The authenticated invitation is invalid or incompatible."
+    if "participant verification" in lowered or "safety code" in lowered:
+        return message or "Compare and confirm the safety code before chatting."
     if "timed out" in lowered or "timeout" in lowered:
         return "The secure connection timed out. Please try again."
     if "secure session" in lowered or "handshake" in lowered:
@@ -164,40 +185,110 @@ def start_tor() -> Controller:
             raise RuntimeError(f"Failed to start Tor using '{command}': {exc}") from exc
 
 
+def _reset_participant_verification(preserve_private_key: bool = True) -> None:
+    global _private_key, _peer_public_key, _box, _verification_code
+    global _verification_local_confirmed, _verification_peer_confirmed
+    with state_lock:
+        if not preserve_private_key:
+            _private_key = None
+        _peer_public_key = None
+        _box = None
+        _verification_code = None
+        _verification_local_confirmed = False
+        _verification_peer_confirmed = False
+        handshake_event.clear()
+        verification_event.clear()
+
+
 def _reset_crypto() -> None:
-    global _private_key, _box
+    global _private_key
     with state_lock:
         _private_key = PrivateKey.generate()
-        _box = None
-        handshake_event.clear()
+    _reset_participant_verification(preserve_private_key=True)
 
 
 def _clear_crypto() -> None:
-    global _private_key, _box
-    with state_lock:
-        _private_key = None
-        _box = None
-        handshake_event.clear()
+    _reset_participant_verification(preserve_private_key=False)
 
 
-def _public_key_b64() -> str:
+def _public_key_bytes() -> bytes:
     global _private_key
     with state_lock:
         if _private_key is None:
             _private_key = PrivateKey.generate()
-        return base64.b64encode(bytes(_private_key.public_key)).decode("ascii")
+        return bytes(_private_key.public_key)
 
 
-def _install_peer_public_key(value: str) -> None:
-    global _private_key, _box
+def _public_key_b64() -> str:
+    return base64.b64encode(_public_key_bytes()).decode("ascii")
+
+
+def _room_onion_address() -> str:
+    with state_lock:
+        room = dict(_active_room or {})
+    onion = str(room.get("onion_address", "")).strip().lower()
+    if not onion:
+        raise RuntimeError("Active room is missing its onion address")
+    return onion
+
+
+def _install_peer_public_key(value: str, expected_public_key: Optional[bytes] = None) -> None:
+    global _peer_public_key, _box
     raw = base64.b64decode(value, validate=True)
     if len(raw) != 32:
         raise ValueError("Peer public key has an invalid length")
+    if expected_public_key is not None and not hmac.compare_digest(raw, expected_public_key):
+        raise ValueError("The host key does not match the authenticated invitation")
     with state_lock:
         if _private_key is None:
-            _private_key = PrivateKey.generate()
+            raise RuntimeError("Local session key is unavailable")
+        _peer_public_key = bytes(raw)
         _box = Box(_private_key, PublicKey(raw))
         handshake_event.set()
+        verification_event.clear()
+
+
+def _encode_handshake_nonce(value: bytes) -> str:
+    if len(value) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Handshake nonce has an invalid length")
+    return base64.b64encode(value).decode("ascii")
+
+
+def _decode_handshake_nonce(value: str) -> bytes:
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Peer handshake nonce is malformed") from exc
+    if len(raw) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Peer handshake nonce has an invalid length")
+    if not hmac.compare_digest(_encode_handshake_nonce(raw), value):
+        raise ValueError("Peer handshake nonce is not canonically encoded")
+    return raw
+
+
+def _set_verification_code(mode: str, local_nonce: bytes, peer_nonce: bytes) -> None:
+    global _verification_code
+    onion = _room_onion_address()
+    with state_lock:
+        if _private_key is None or _peer_public_key is None:
+            raise RuntimeError("Session keys are unavailable for participant verification")
+        local_public_key = bytes(_private_key.public_key)
+        peer_public_key = bytes(_peer_public_key)
+        if mode == "host":
+            host_key, guest_key = local_public_key, peer_public_key
+            host_nonce, guest_nonce = local_nonce, peer_nonce
+        elif mode == "guest":
+            host_key, guest_key = peer_public_key, local_public_key
+            host_nonce, guest_nonce = peer_nonce, local_nonce
+        else:
+            raise ValueError("Participant verification mode must be host or guest")
+        _verification_code = derive_safety_code(
+            host_key,
+            guest_key,
+            onion,
+            host_nonce,
+            guest_nonce,
+        )
 
 
 def encrypt_message(message: str) -> str:
@@ -222,6 +313,123 @@ def _send_frame(conn: socket.socket, frame: dict[str, Any]) -> None:
         raise ValueError("Peer frame is too large")
     with send_lock:
         conn.sendall(data)
+
+
+def _receive_handshake_frame(conn: socket.socket) -> dict[str, Any]:
+    previous_timeout = conn.gettimeout()
+    data = bytearray()
+    try:
+        conn.settimeout(HANDSHAKE_TIMEOUT)
+        while True:
+            try:
+                chunk = conn.recv(1)
+            except socket.timeout as exc:
+                raise TimeoutError("Secure session handshake timed out") from exc
+            if not chunk:
+                raise ConnectionError("Peer closed before the secure session handshake completed")
+            if chunk == b"\n":
+                break
+            data.extend(chunk)
+            if len(data) > MAX_FRAME_BYTES:
+                raise ValueError("Peer handshake frame is too large")
+    finally:
+        conn.settimeout(previous_timeout)
+
+    try:
+        frame = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Peer sent a malformed handshake frame") from exc
+    if not isinstance(frame, dict):
+        raise ValueError("Peer handshake frame must be an object")
+    return frame
+
+
+def _perform_handshake(
+    conn: socket.socket,
+    mode: str,
+    expected_host_public_key: Optional[bytes] = None,
+) -> None:
+    if mode not in {"host", "guest"}:
+        raise ValueError("Handshake mode must be host or guest")
+    peer_role = "guest" if mode == "host" else "host"
+    local_nonce = secrets.token_bytes(HANDSHAKE_NONCE_BYTES)
+    _send_frame(
+        conn,
+        {
+            "type": "hello",
+            "v": PROTOCOL_VERSION,
+            "role": mode,
+            "public_key": _public_key_b64(),
+            "nonce": _encode_handshake_nonce(local_nonce),
+        },
+    )
+    frame = _receive_handshake_frame(conn)
+    kind = str(frame.get("type", ""))
+    if kind == "error":
+        raise RuntimeError(str(frame.get("message", "Peer refused the connection")))
+    if kind != "hello":
+        raise ValueError(f"Expected peer hello frame, received {kind or '<empty>'}")
+    if frame.get("v") != PROTOCOL_VERSION:
+        raise ValueError("Peer protocol version is incompatible")
+    if frame.get("role") != peer_role:
+        raise ValueError("Peer handshake role is invalid")
+    peer_nonce = _decode_handshake_nonce(str(frame.get("nonce", "")))
+    expected_key = expected_host_public_key if mode == "guest" else None
+    _install_peer_public_key(str(frame.get("public_key", "")), expected_key)
+    _set_verification_code(mode, local_nonce, peer_nonce)
+    if _box is None or not handshake_event.is_set() or not _verification_code:
+        raise RuntimeError("Secure session handshake did not establish participant verification")
+
+
+def _mark_verified_if_complete() -> bool:
+    became_verified = False
+    with state_lock:
+        if _verification_local_confirmed and _verification_peer_confirmed:
+            if not verification_event.is_set():
+                verification_event.set()
+                became_verified = True
+    if became_verified:
+        _queue_frontend_message("__peer_verified__")
+    return verification_event.is_set()
+
+
+def _handle_peer_verification(ciphertext: str) -> None:
+    global _verification_peer_confirmed
+    plaintext = decrypt_message(ciphertext)
+    with state_lock:
+        code = _verification_code
+    if not code:
+        raise RuntimeError("Participant verification code is unavailable")
+    validate_confirmation_payload(plaintext, code)
+    with state_lock:
+        _verification_peer_confirmed = True
+    _mark_verified_if_complete()
+
+
+def confirm_verification() -> dict[str, Any]:
+    global _verification_local_confirmed
+    with peer_lock:
+        conn = active_peer_socket
+    with state_lock:
+        code = _verification_code
+        encrypted = _box is not None and handshake_event.is_set()
+    if conn is None or not encrypted or not code:
+        return {"status": "error", "error": "No encrypted peer session is ready for verification"}
+
+    ciphertext = encrypt_message(build_confirmation_payload(code))
+    try:
+        _send_frame(conn, {"type": "verification", "ciphertext": ciphertext})
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"status": "error", "error": _friendly_error(exc)}
+
+    with state_lock:
+        _verification_local_confirmed = True
+    verified = _mark_verified_if_complete()
+    return {
+        "status": "verified" if verified else "waiting_for_peer",
+        "verified": verified,
+        "verification_code": code,
+    }
 
 
 def _queue_frontend_message(message: str) -> None:
@@ -261,9 +469,13 @@ def _process_peer_frame(conn: socket.socket, raw: bytes) -> bool:
         raise ValueError("Peer frame must be an object")
     kind = str(frame.get("type", ""))
     if kind == "hello":
-        _install_peer_public_key(str(frame.get("public_key", "")))
+        raise ValueError("Unexpected hello frame after the handshake completed")
+    if kind == "verification":
+        _handle_peer_verification(str(frame.get("ciphertext", "")))
         return True
     if kind == "message":
+        if not verification_event.is_set():
+            raise RuntimeError("Participant verification is required before messaging")
         plaintext = decrypt_message(str(frame.get("ciphertext", "")))
         if plaintext == "__disconnect__":
             return False
@@ -300,10 +512,30 @@ def _read_socket_messages(conn: socket.socket) -> None:
             return
 
 
-def _peer_session(conn: socket.socket, mode: str) -> None:
+def _release_failed_host_connection(conn: socket.socket, exc: Exception) -> None:
+    global active_peer_socket, _peer_count
+    with peer_lock:
+        if active_peer_socket is conn:
+            active_peer_socket = None
+    _close_socket(conn)
+    with state_lock:
+        if _connection_mode == "host" and _active_room is not None:
+            _peer_count = 1
+    _reset_participant_verification(preserve_private_key=True)
+    if not stop_event.is_set():
+        _queue_frontend_message(f"Secure connection attempt failed: {_friendly_error(exc)}")
+
+
+def _peer_session(
+    conn: socket.socket,
+    mode: str,
+    handshake_complete: bool = False,
+    expected_host_public_key: Optional[bytes] = None,
+) -> None:
     global active_peer_socket, guest_socket, _peer_count, _active_room, _connection_mode
     try:
-        _send_frame(conn, {"type": "hello", "public_key": _public_key_b64()})
+        if not handshake_complete:
+            _perform_handshake(conn, mode, expected_host_public_key)
         _read_socket_messages(conn)
     finally:
         with peer_lock:
@@ -315,7 +547,7 @@ def _peer_session(conn: socket.socket, mode: str) -> None:
         with state_lock:
             if mode == "host" and _connection_mode == "host" and _active_room is not None:
                 _peer_count = 1
-                _reset_crypto()
+                _reset_participant_verification(preserve_private_key=True)
                 if not stop_event.is_set():
                     _queue_frontend_message("__peer_left__")
             elif mode == "guest" and _connection_mode == "guest":
@@ -335,10 +567,18 @@ def _handle_guest(conn: socket.socket) -> None:
         finally:
             _close_socket(conn)
         return
+
+    _reset_participant_verification(preserve_private_key=True)
+    try:
+        _perform_handshake(conn, "host")
+    except Exception as exc:
+        _release_failed_host_connection(conn, exc)
+        return
+
     with state_lock:
         _peer_count = 2
     _queue_frontend_message("__peer_joined__")
-    _peer_session(conn, "host")
+    _peer_session(conn, "host", handshake_complete=True)
 
 
 def _listener_loop(server: socket.socket) -> None:
@@ -398,9 +638,10 @@ def _extract_onion_host(value: str) -> str:
     return match.group(1).lower()
 
 
-def join_room(onion_address: str, port: int) -> dict[str, Any]:
+def join_room(invitation: str, port: int) -> dict[str, Any]:
     global guest_socket, _peer_count, _active_room, _connection_mode
-    onion_host = _extract_onion_host(onion_address)
+    authenticated_invite = parse_invite(invitation)
+    onion_host = authenticated_invite.onion_address
     close_room()
     start_tor()
     if not active_socks_port:
@@ -424,12 +665,34 @@ def join_room(onion_address: str, port: int) -> dict[str, Any]:
     guest_socket = client
     _peer_count = 1
     _connection_mode = "guest"
-    _active_room = {"mode": "guest", "onion_address": onion_host, "port": port}
-    threading.Thread(target=_peer_session, args=(client, "guest"), daemon=True).start()
-    if not handshake_event.wait(HANDSHAKE_TIMEOUT):
+    _active_room = {
+        "mode": "guest",
+        "onion_address": onion_host,
+        "port": port,
+        "expected_host_public_key": authenticated_invite.host_public_key,
+    }
+    try:
+        _perform_handshake(client, "guest", authenticated_invite.host_public_key)
+    except Exception:
         close_room()
-        raise RuntimeError("Secure session handshake timed out")
-    return {"status": "connected", "onion_address": onion_host, "port": port}
+        raise
+    with state_lock:
+        _peer_count = 2
+        code = _verification_code
+    threading.Thread(
+        target=_peer_session,
+        args=(client, "guest", True, authenticated_invite.host_public_key),
+        daemon=True,
+    ).start()
+    return {
+        "status": "connected",
+        "onion_address": onion_host,
+        "port": port,
+        "encrypted": True,
+        "verified": False,
+        "verification_code": code,
+        "protocol_version": PROTOCOL_VERSION,
+    }
 
 
 def send_message(text: str) -> dict[str, str]:
@@ -440,6 +703,11 @@ def send_message(text: str) -> dict[str, str]:
         conn = active_peer_socket
     if conn is None:
         return {"status": "error", "error": "No active peer socket"}
+    if not verification_event.is_set():
+        return {
+            "status": "error",
+            "error": "Compare and confirm the participant safety code before sending messages",
+        }
     try:
         _send_frame(conn, {"type": "message", "ciphertext": encrypt_message(payload)})
         return {"status": "sent"}
@@ -514,10 +782,12 @@ def build_room_response(room_name: str) -> dict[str, Any]:
     }
     _connection_mode = "host"
     _peer_count = 1
+    invitation = build_invite(room["onion_address"], _public_key_bytes())
     return {
         "friendly_name": room_name,
         "onion_address": room["onion_address"],
-        "share_link": f"Join {room_name} → {room['onion_address']}",
+        "share_link": invitation,
+        "protocol_version": PROTOCOL_VERSION,
     }
 
 
@@ -525,9 +795,20 @@ def poll_messages() -> dict[str, Any]:
     with inbox_lock:
         messages = list(_inbox)
         _inbox.clear()
+    with state_lock:
+        encrypted = _box is not None and handshake_event.is_set()
+        verified = verification_event.is_set()
+        code = _verification_code
+        local_confirmed = _verification_local_confirmed
+        peer_confirmed = _verification_peer_confirmed
     return {
         "messages": messages,
-        "encrypted": _box is not None and handshake_event.is_set(),
+        "encrypted": encrypted,
+        "verified": verified,
+        "verification_code": code,
+        "verification_local_confirmed": local_confirmed,
+        "verification_peer_confirmed": peer_confirmed,
+        "protocol_version": PROTOCOL_VERSION,
         "tor_active": tor_controller is not None,
         "peer_count": _peer_count,
     }
@@ -557,6 +838,8 @@ def handle_json_command(payload: dict[str, Any]) -> dict[str, Any]:
             except (TypeError, ValueError):
                 port = DEFAULT_ONION_PORT
             return join_room(address, port)
+        if command == "confirm_verification":
+            return confirm_verification()
         if command == "send_message":
             return send_message(str(payload.get("text", payload.get("message", ""))))
         if command == "close_room":

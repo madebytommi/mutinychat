@@ -33,6 +33,11 @@
   let toastVisible = $state(false);
   let isEncrypted = $state(false);
   let isTorProtected = $state(false);
+  let isPeerVerified = $state(false);
+  let verificationCode = $state("");
+  let verificationLocalConfirmed = $state(false);
+  let verificationPeerConfirmed = $state(false);
+  let peerCount = $state(0);
   let alertMessage = $state("");
   let alertVisible = $state(false);
   let shutdownRequested = $state(false);
@@ -96,6 +101,11 @@
 
   async function sendMessage() {
     if (currentView !== "chat") {
+      return;
+    }
+
+    if (!isPeerVerified) {
+      showAlert("Compare and confirm the safety code before messaging.");
       return;
     }
 
@@ -201,6 +211,11 @@
     joinLinkDraft = "";
     isEncrypted = false;
     isTorProtected = false;
+    isPeerVerified = false;
+    verificationCode = "";
+    verificationLocalConfirmed = false;
+    verificationPeerConfirmed = false;
+    peerCount = 0;
     shutdownRequested = false;
     currentView = "lobby";
     backendStatus = "Room closed";
@@ -288,19 +303,18 @@
   }
 
   /** @param {string} input */
-  function extractOnionAddress(input) {
+  function normalizeAuthenticatedInvite(input) {
     const raw = String(input || "").trim();
-    const match = raw.match(/([a-z2-7]{16,56}\.onion)/i);
-    if (match?.[1]) {
-      return match[1].toLowerCase();
+    if (!raw.toLowerCase().startsWith("mutinychat://join?")) {
+      throw new Error("Paste the complete authenticated MutinyChat invitation");
     }
-    throw new Error("No valid .onion address found. Paste the exact share link copied from the host room");
+    return raw;
   }
 
   async function joinRoomFromFrontend() {
-    let onion;
+    let invitation;
     try {
-      onion = extractOnionAddress(joinLinkDraft);
+      invitation = normalizeAuthenticatedInvite(joinLinkDraft);
     } catch (error) {
       backendStatus = `Backend error: ${String(error)}`;
       showAlert("Invalid share link.");
@@ -312,7 +326,7 @@
       backendStatus = "Joining room...";
       const response = await invoke("backend_ipc", {
         command: "join_room",
-        message: onion,
+        message: invitation,
         roomName: null
       });
       const parsed = JSON.parse(String(response));
@@ -321,20 +335,50 @@
       }
 
       onionAddress = String(parsed.onion_address || "");
-      friendName = "Connected!";
-      connectionStatus = "Connected";
+      friendName = "Peer";
+      connectionStatus = "Verification required";
       messages = [];
       draft = "";
-      isEncrypted = false;
+      isEncrypted = Boolean(parsed.encrypted);
+      isPeerVerified = Boolean(parsed.verified);
+      verificationCode = String(parsed.verification_code || "");
+      verificationLocalConfirmed = false;
+      verificationPeerConfirmed = false;
+      peerCount = 2;
       currentView = "chat";
       showJoinModal = false;
-      backendStatus = "Connected!";
+      backendStatus = "Encrypted connection ready — compare the safety code";
       playRetroSound("door");
     } catch (error) {
       backendStatus = `Backend error: ${String(error)}`;
       showAlert("Could not join room. Check the link and try again.");
     } finally {
       isJoiningRoom = false;
+    }
+  }
+
+
+  async function confirmSafetyCode() {
+    if (!verificationCode || verificationLocalConfirmed) return;
+    try {
+      const response = await invoke("backend_ipc", {
+        command: "confirm_verification",
+        message: null,
+        roomName: null
+      });
+      const parsed = JSON.parse(String(response));
+      if (parsed.status === "error") {
+        throw new Error(parsed.error || "Verification confirmation failed");
+      }
+      verificationLocalConfirmed = true;
+      isPeerVerified = Boolean(parsed.verified);
+      connectionStatus = isPeerVerified ? "Verified" : "Waiting for peer confirmation";
+      backendStatus = isPeerVerified
+        ? "Participant verified for this session"
+        : "Your confirmation was sent — waiting for your peer";
+    } catch (error) {
+      backendStatus = `Backend error: ${String(error)}`;
+      showAlert("Could not confirm the safety code.");
     }
   }
 
@@ -399,9 +443,11 @@
 
   function startChatting() {
     messages = [];
-    friendName = `${roomName}-friend`;
-    connectionStatus = "Connected";
-    backendStatus = "Live chat ready";
+    friendName = "Peer";
+    connectionStatus = peerCount >= 2 ? "Verification required" : "Waiting for peer";
+    backendStatus = peerCount >= 2
+      ? "Encrypted connection ready — compare the safety code"
+      : "Waiting for a peer to join";
     currentView = "chat";
   }
 
@@ -469,20 +515,54 @@
         const parsed = JSON.parse(String(response));
         isEncrypted = Boolean(parsed.encrypted);
         isTorProtected = Boolean(parsed.tor_active);
+        isPeerVerified = Boolean(parsed.verified);
+        verificationCode = String(parsed.verification_code || "");
+        verificationLocalConfirmed = Boolean(parsed.verification_local_confirmed);
+        verificationPeerConfirmed = Boolean(parsed.verification_peer_confirmed);
+        peerCount = Number(parsed.peer_count || 0);
+        if (peerCount >= 2) {
+          connectionStatus = isPeerVerified ? "Verified" : "Verification required";
+        } else if (currentView !== "lobby") {
+          connectionStatus = "Waiting for peer";
+        }
         const items = Array.isArray(parsed.messages) ? parsed.messages : [];
         for (const item of items) {
           const payload = String(item);
           if (payload === "room_deleted") {
             messages = [];
             isEncrypted = false;
+            isPeerVerified = false;
+            verificationCode = "";
+            verificationLocalConfirmed = false;
+            verificationPeerConfirmed = false;
+            peerCount = 0;
             currentView = "lobby";
             showToast("Room closed – chat history erased");
             continue;
           }
 
           if (payload === "__peer_joined__") {
-            connectionStatus = "Connected";
+            connectionStatus = "Verification required";
             playRetroSound("door");
+            continue;
+          }
+
+          if (payload === "__peer_verified__") {
+            isPeerVerified = true;
+            connectionStatus = "Verified";
+            showToast("Participant verified for this session");
+            continue;
+          }
+
+          if (payload === "__peer_left__") {
+            isEncrypted = false;
+            isPeerVerified = false;
+            verificationCode = "";
+            verificationLocalConfirmed = false;
+            verificationPeerConfirmed = false;
+            peerCount = 1;
+            connectionStatus = "Waiting for peer";
+            showToast("Peer disconnected");
             continue;
           }
 
@@ -592,8 +672,8 @@
         <!-- Title -->
         <span class="title-text text-nowrap">MutinyChat</span>
         <!-- E2EE encryption badge -->
-        <span class:encrypted={isEncrypted} class="encryption-badge d-inline-block flex-shrink-0" aria-live="polite">
-          {isEncrypted ? "🔒 E2EE" : "🔓 Not Encrypted"}
+        <span class:encrypted={isEncrypted} class:verified={isPeerVerified} class="encryption-badge d-inline-block flex-shrink-0" aria-live="polite">
+          {isPeerVerified ? "✅ Verified E2EE" : isEncrypted ? "🔒 Encrypted • Unverified" : "🔓 Not Encrypted"}
         </span>
         <!-- Tor protection badge -->
         <span class:active={isTorProtected} class="tor-badge d-inline-block flex-shrink-0" aria-live="polite">
@@ -648,7 +728,7 @@
         <!-- Buddy card showing current connection status -->
         <div class="buddy-card card card-sm flex-shrink-0 mb-2">
           <div class="card-body p-2 d-flex align-items-center gap-2">
-            <span class:status-online={connectionStatus === "Connected"} class="status-dot flex-shrink-0" aria-hidden="true"></span>
+            <span class:status-online={peerCount >= 2} class="status-dot flex-shrink-0" aria-hidden="true"></span>
             <span class="buddy-text text-truncate">{friendName}</span>
           </div>
         </div>
@@ -656,14 +736,14 @@
         <!-- Connection status indicator -->
         <p class="connection-label mb-2 small text-nowrap d-flex align-items-center gap-1">
           Status:
-          <span class:status-connected={connectionStatus === "Connected"} class="connection-state fw-bold flex-shrink-0">
+          <span class:status-connected={isPeerVerified} class="connection-state fw-bold flex-shrink-0">
             {connectionStatus}
           </span>
         </p>
 
         <!-- Room lifecycle status -->
         <p class="room-lifecycle-status small mb-2 p-2 text-center">
-          {connectionStatus === "Connected" ? "2/2 connected - room will vanish when both leave" : "1/2 connected - room will vanish when both leave"}
+          {peerCount >= 2 ? "2/2 connected - verify before chatting" : "1/2 connected - waiting for peer"}
         </p>
 
         <!-- Ephemeral messages note -->
@@ -772,6 +852,32 @@
 
         {:else}
           <!-- Chat view: Messages and input -->
+          <section class="verification-panel alert {isPeerVerified ? 'alert-success' : 'alert-warning'} m-2 mb-0" aria-live="polite">
+            {#if isPeerVerified}
+              <p class="fw-bold mb-1">✅ Participant verified for this session</p>
+              <p class="small mb-0">This only proves that both apps saw the same session keys after you compared the code.</p>
+            {:else if isEncrypted && verificationCode}
+              <p class="fw-bold mb-1">Compare this safety code</p>
+              <code class="safety-code d-block text-center my-2">{verificationCode}</code>
+              <p class="small mb-2">
+                Compare it by voice, in person, or another trusted channel. Do not compare it only through the same message that carried the invitation.
+              </p>
+              <p class="small mb-2">
+                You: {verificationLocalConfirmed ? "confirmed" : "not confirmed"} · Peer: {verificationPeerConfirmed ? "confirmed" : "not confirmed"}
+              </p>
+              <button
+                class="btn btn-sm btn-primary"
+                type="button"
+                onclick={confirmSafetyCode}
+                disabled={verificationLocalConfirmed}
+              >
+                {verificationLocalConfirmed ? "Waiting for peer" : "I compared it and it matches"}
+              </button>
+            {:else}
+              <p class="small mb-0">Waiting for the encrypted handshake and safety code.</p>
+            {/if}
+          </section>
+
           <div class="chat-area flex-grow-1 d-flex flex-column gap-2 overflow-auto p-3" aria-label="Chat messages" bind:this={chatAreaEl}>
             {#if messages.length === 0}
               <p class="empty-chat small text-muted text-center">No messages yet. Type below to test local send logging.</p>
@@ -798,17 +904,20 @@
             <!-- Encryption warning if not encrypted -->
             {#if !isEncrypted}
               <p class="encryption-warning alert alert-warning small mb-2">🔓 Not Encrypted</p>
+            {:else if !isPeerVerified}
+              <p class="encryption-warning alert alert-warning small mb-2">🔒 Encrypted, but participant identity is not verified</p>
             {/if}
             <!-- Input and send button -->
             <div class="d-flex gap-2">
               <input
                 class="chat-input form-control form-control-sm"
                 type="text"
-                placeholder="Type a message..."
+                placeholder={isPeerVerified ? "Type a message..." : "Verify the safety code first"}
                 bind:value={draft}
                 onkeydown={handleInputKeydown}
+                disabled={!isPeerVerified}
               />
-              <button class="send-button btn btn-primary btn-sm fw-bold text-nowrap" type="submit">Send</button>
+              <button class="send-button btn btn-primary btn-sm fw-bold text-nowrap" type="submit" disabled={!isPeerVerified}>Send</button>
             </div>
           </form>
         {/if}

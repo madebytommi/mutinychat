@@ -14,6 +14,8 @@ Implemented:
 - Python stdio JSON backend
 - Tor onion-service hosting and SOCKS connections through Stem and PySocks
 - PyNaCl public-key session handshake and encrypted messages
+- Authenticated invitations that bind the onion address to the host session key
+- A 20-digit participant safety code that both people must compare and confirm before messaging
 - One host and one guest per room
 - Windows and macOS packaging work
 
@@ -66,6 +68,8 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - Python process in development, compiled PyInstaller sidecar in Windows releases
 - Tor onion services and SOCKS connections through Stem and PySocks
 - PyNaCl `Box` public-key handshake and encrypted messages
+- Invitation-bound host keys plus a session safety code derived from both ephemeral keys and the onion address
+- Chat remains locked until both participants confirm that they compared the same safety code
 - Runtime Tor data stored in a temporary writable directory and removed during normal shutdown
 
 ## Repository layout
@@ -192,7 +196,7 @@ These steps are required before calling a release fully verified. They are not m
 
 - Windows builds are unsigned and may trigger SmartScreen.
 - CI cannot prove two-peer Tor connectivity on separate machines.
-- No user-verifiable safety-number or identity-verification UI exists yet.
+- First-contact identity still requires the two people to compare the safety code through a separate trusted channel; the app cannot automatically know a person's real-world identity.
 - The cryptographic and networking design has not received an independent professional audit.
 - Unexpected termination may leave temporary Tor data until the operating system cleans its temporary directory.
 - The application remains a two-person prototype rather than a general-purpose group messenger.
@@ -202,6 +206,9 @@ These steps are required before calling a release fully verified. They are not m
 - No central chat server is used by design.
 - Retro sound effects are generated locally; MutinyChat does not load sound effects from Mixkit or another third-party service.
 - Removing third-party sound requests does not mean every application network flow is automatically protected by Tor.
+- An authenticated invitation detects a host-key mismatch, while the safety-code comparison detects full invitation substitution when users compare it through an independent trusted channel.
+- Never confirm a safety code without actually comparing it with the intended participant. A user who blindly confirms can still accept an attacker.
+- Verification applies only to the current ephemeral session and does not create a persistent identity or contact record.
 - Do not treat prototype status as a guarantee of anonymity or security.
 - Do not expose encryption material in logs or bug reports.
 - Code signing can be added later using protected CI secrets; no private signing material belongs in the repository.
