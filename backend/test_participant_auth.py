@@ -3,6 +3,7 @@ import unittest
 from nacl.public import PrivateKey
 
 from participant_auth import (
+    MAX_INVITE_CHARS,
     PROTOCOL_VERSION,
     build_confirmation_payload,
     build_invite,
@@ -34,6 +35,15 @@ class ParticipantAuthenticationTestCase(unittest.TestCase):
         malformed = invite.replace("host_key=", "host_key=short")
         with self.assertRaises(ValueError):
             parse_invite(malformed)
+
+    def test_invite_rejects_padded_noncanonical_host_key(self):
+        invite = build_invite(self.onion, bytes(self.host.public_key))
+        with self.assertRaisesRegex(ValueError, "canonically"):
+            parse_invite(invite + "%3D")
+
+    def test_invite_rejects_oversized_input(self):
+        with self.assertRaisesRegex(ValueError, "too long"):
+            parse_invite("x" * (MAX_INVITE_CHARS + 1))
 
     def test_safety_code_is_symmetric_and_session_bound(self):
         host_key = bytes(self.host.public_key)
