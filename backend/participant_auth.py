@@ -14,6 +14,7 @@ PROTOCOL_VERSION = 2
 INVITE_SCHEME = "mutinychat"
 INVITE_HOST = "join"
 PUBLIC_KEY_BYTES = 32
+HANDSHAKE_NONCE_BYTES = 32
 SAFETY_CODE_DIGITS = 20
 MAX_INVITE_CHARS = 512
 ONION_V3_RE = re.compile(r"^[a-z2-7]{56}\.onion$", re.IGNORECASE)
@@ -108,18 +109,31 @@ def parse_invite(value: str) -> AuthenticatedInvite:
     )
 
 
-def derive_safety_code(local_public_key: bytes, peer_public_key: bytes, onion_address: str) -> str:
-    if len(local_public_key) != PUBLIC_KEY_BYTES or len(peer_public_key) != PUBLIC_KEY_BYTES:
+def derive_safety_code(
+    host_public_key: bytes,
+    guest_public_key: bytes,
+    onion_address: str,
+    host_nonce: bytes,
+    guest_nonce: bytes,
+) -> str:
+    if len(host_public_key) != PUBLIC_KEY_BYTES or len(guest_public_key) != PUBLIC_KEY_BYTES:
         raise ValueError("Safety-code keys must each be 32 bytes")
+    if len(host_nonce) != HANDSHAKE_NONCE_BYTES or len(guest_nonce) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Safety-code handshake nonces must each be 32 bytes")
     onion = _validate_onion(onion_address).encode("ascii")
-    first, second = sorted((bytes(local_public_key), bytes(peer_public_key)))
     transcript = b"\x00".join(
         (
             b"MutinyChat participant safety code",
             str(PROTOCOL_VERSION).encode("ascii"),
             onion,
-            first,
-            second,
+            b"host-key",
+            bytes(host_public_key),
+            b"guest-key",
+            bytes(guest_public_key),
+            b"host-nonce",
+            bytes(host_nonce),
+            b"guest-nonce",
+            bytes(guest_nonce),
         )
     )
     digest = hashlib.sha256(transcript).digest()
