@@ -15,6 +15,7 @@ INVITE_SCHEME = "mutinychat"
 INVITE_HOST = "join"
 PUBLIC_KEY_BYTES = 32
 SAFETY_CODE_DIGITS = 20
+MAX_INVITE_CHARS = 512
 ONION_V3_RE = re.compile(r"^[a-z2-7]{56}\.onion$", re.IGNORECASE)
 
 
@@ -42,7 +43,7 @@ def decode_public_key(value: str) -> bytes:
         raise ValueError("Invitation host key is malformed") from exc
     if len(raw) != PUBLIC_KEY_BYTES:
         raise ValueError("Invitation host key has an invalid length")
-    if not hmac.compare_digest(encode_public_key(raw), encoded.rstrip("=")):
+    if not hmac.compare_digest(encode_public_key(raw), encoded):
         raise ValueError("Invitation host key is not canonically encoded")
     return raw
 
@@ -68,6 +69,8 @@ def build_invite(onion_address: str, host_public_key: bytes) -> str:
 
 def parse_invite(value: str) -> AuthenticatedInvite:
     raw = value.strip()
+    if not raw or len(raw) > MAX_INVITE_CHARS:
+        raise ValueError("Invitation link is missing or too long")
     try:
         parsed = urlsplit(raw)
     except ValueError as exc:
@@ -75,7 +78,11 @@ def parse_invite(value: str) -> AuthenticatedInvite:
 
     if parsed.scheme.lower() != INVITE_SCHEME or parsed.netloc.lower() != INVITE_HOST:
         raise ValueError("Paste the complete authenticated MutinyChat invitation")
-    if parsed.path not in ("", "/") or parsed.fragment or parsed.username or parsed.password or parsed.port:
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invitation link contains an invalid port") from exc
+    if parsed.path not in ("", "/") or parsed.fragment or parsed.username or parsed.password or port:
         raise ValueError("Invitation link contains unsupported components")
 
     try:
