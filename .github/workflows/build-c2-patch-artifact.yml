@@ -1,0 +1,35 @@
+name: Build C2 participant authentication patch
+
+on:
+  push:
+    branches:
+      - chatgpt/authenticate-participants
+
+permissions:
+  contents: read
+
+jobs:
+  build-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch in temporary workspace
+        run: python scripts/apply-c2-participant-auth.py
+      - name: Compile patched Python files
+        run: python -m compileall -q backend/main.py backend/sidecar.py backend/participant_auth.py backend/test_main.py backend/test_sidecar.py backend/test_participant_auth.py
+      - name: Upload patched source files
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2-participant-auth-patched-files-${{ github.sha }}
+          path: |
+            backend/main.py
+            backend/sidecar.py
+            backend/test_main.py
+            backend/test_sidecar.py
+            src/App.svelte
+            README.md
+          if-no-files-found: error
+          retention-days: 2
