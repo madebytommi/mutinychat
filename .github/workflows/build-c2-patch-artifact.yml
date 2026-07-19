@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt/authenticate-participants
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
