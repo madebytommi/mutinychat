@@ -104,6 +104,7 @@ class BackendTestCase(unittest.TestCase):
         backend._install_peer_public_key(
             base64.b64encode(bytes(remote.public_key)).decode("ascii")
         )
+        backend._set_verification_code("host", b"h" * 32, b"g" * 32)
         state = backend.poll_messages()
         self.assertTrue(state["encrypted"])
         self.assertFalse(state["verified"])
@@ -141,6 +142,7 @@ class BackendTestCase(unittest.TestCase):
         backend._install_peer_public_key(
             base64.b64encode(bytes(bob.public_key)).decode("ascii")
         )
+        backend._set_verification_code("host", b"h" * 32, b"g" * 32)
         backend._verification_local_confirmed = True
         code = backend.poll_messages()["verification_code"]
         bob_box = Box(bob, alice.public_key)

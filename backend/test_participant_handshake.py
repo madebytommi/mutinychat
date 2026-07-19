@@ -25,6 +25,7 @@ def _send_hello(
     *,
     version: int = PROTOCOL_VERSION,
     role: str = "host",
+    nonce: bytes = b"r" * 32,
 ) -> None:
     _read_line(sock)
     frame = {
@@ -32,6 +33,7 @@ def _send_hello(
         "v": version,
         "role": role,
         "public_key": base64.b64encode(bytes(key.public_key)).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
     }
     sock.sendall((json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8"))
 
@@ -116,6 +118,28 @@ class ParticipantHandshakeTestCase(unittest.TestCase):
             local.close()
             remote.close()
             thread.join(timeout=2)
+
+    def test_replayed_guest_hello_gets_a_fresh_safety_code(self):
+        guest_key = PrivateKey.generate()
+        replayed_nonce = b"g" * 32
+        codes = []
+        for _ in range(2):
+            backend._reset_participant_verification(preserve_private_key=True)
+            local, remote = socket.socketpair()
+            thread = threading.Thread(
+                target=_send_hello,
+                args=(remote, guest_key),
+                kwargs={"role": "guest", "nonce": replayed_nonce},
+            )
+            thread.start()
+            try:
+                backend._perform_handshake(local, "host")
+                codes.append(backend.poll_messages()["verification_code"])
+            finally:
+                local.close()
+                remote.close()
+                thread.join(timeout=2)
+        self.assertNotEqual(codes[0], codes[1])
 
     def test_host_session_key_remains_bound_to_existing_invitation(self):
         first_public_key = backend._public_key_bytes()

@@ -10,6 +10,7 @@ import hmac
 import os
 import random
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from participant_auth import (
+    HANDSHAKE_NONCE_BYTES,
     PROTOCOL_VERSION,
     build_confirmation_payload,
     build_invite,
@@ -231,22 +233,62 @@ def _room_onion_address() -> str:
 
 
 def _install_peer_public_key(value: str, expected_public_key: Optional[bytes] = None) -> None:
-    global _peer_public_key, _box, _verification_code
+    global _peer_public_key, _box
     raw = base64.b64decode(value, validate=True)
     if len(raw) != 32:
         raise ValueError("Peer public key has an invalid length")
     if expected_public_key is not None and not hmac.compare_digest(raw, expected_public_key):
         raise ValueError("The host key does not match the authenticated invitation")
-    onion = _room_onion_address()
     with state_lock:
         if _private_key is None:
             raise RuntimeError("Local session key is unavailable")
-        local_public_key = bytes(_private_key.public_key)
         _peer_public_key = bytes(raw)
         _box = Box(_private_key, PublicKey(raw))
-        _verification_code = derive_safety_code(local_public_key, raw, onion)
         handshake_event.set()
         verification_event.clear()
+
+
+def _encode_handshake_nonce(value: bytes) -> str:
+    if len(value) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Handshake nonce has an invalid length")
+    return base64.b64encode(value).decode("ascii")
+
+
+def _decode_handshake_nonce(value: str) -> bytes:
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Peer handshake nonce is malformed") from exc
+    if len(raw) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Peer handshake nonce has an invalid length")
+    if not hmac.compare_digest(_encode_handshake_nonce(raw), value):
+        raise ValueError("Peer handshake nonce is not canonically encoded")
+    return raw
+
+
+def _set_verification_code(mode: str, local_nonce: bytes, peer_nonce: bytes) -> None:
+    global _verification_code
+    onion = _room_onion_address()
+    with state_lock:
+        if _private_key is None or _peer_public_key is None:
+            raise RuntimeError("Session keys are unavailable for participant verification")
+        local_public_key = bytes(_private_key.public_key)
+        peer_public_key = bytes(_peer_public_key)
+        if mode == "host":
+            host_key, guest_key = local_public_key, peer_public_key
+            host_nonce, guest_nonce = local_nonce, peer_nonce
+        elif mode == "guest":
+            host_key, guest_key = peer_public_key, local_public_key
+            host_nonce, guest_nonce = peer_nonce, local_nonce
+        else:
+            raise ValueError("Participant verification mode must be host or guest")
+        _verification_code = derive_safety_code(
+            host_key,
+            guest_key,
+            onion,
+            host_nonce,
+            guest_nonce,
+        )
 
 
 def encrypt_message(message: str) -> str:
@@ -310,6 +352,7 @@ def _perform_handshake(
     if mode not in {"host", "guest"}:
         raise ValueError("Handshake mode must be host or guest")
     peer_role = "guest" if mode == "host" else "host"
+    local_nonce = secrets.token_bytes(HANDSHAKE_NONCE_BYTES)
     _send_frame(
         conn,
         {
@@ -317,6 +360,7 @@ def _perform_handshake(
             "v": PROTOCOL_VERSION,
             "role": mode,
             "public_key": _public_key_b64(),
+            "nonce": _encode_handshake_nonce(local_nonce),
         },
     )
     frame = _receive_handshake_frame(conn)
@@ -329,8 +373,10 @@ def _perform_handshake(
         raise ValueError("Peer protocol version is incompatible")
     if frame.get("role") != peer_role:
         raise ValueError("Peer handshake role is invalid")
+    peer_nonce = _decode_handshake_nonce(str(frame.get("nonce", "")))
     expected_key = expected_host_public_key if mode == "guest" else None
     _install_peer_public_key(str(frame.get("public_key", "")), expected_key)
+    _set_verification_code(mode, local_nonce, peer_nonce)
     if _box is None or not handshake_event.is_set() or not _verification_code:
         raise RuntimeError("Secure session handshake did not establish participant verification")
 
