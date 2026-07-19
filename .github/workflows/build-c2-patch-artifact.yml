@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Repair patch script
+        run: python scripts/fix-c2-patch-script.py
       - name: Apply patch in temporary workspace
         id: patch
         shell: bash
