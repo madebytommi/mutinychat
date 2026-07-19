@@ -4,56 +4,33 @@ on:
   push:
     branches:
       - chatgpt/authenticate-participants
-  pull_request:
-    branches:
-      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-patch:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/authenticate-participants
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Repair patch script
-        run: python scripts/fix-c2-patch-script.py
-      - name: Apply patch in temporary workspace
-        id: patch
-        shell: bash
+      - name: Repair and apply patch
         run: |
-          set +e
-          python scripts/apply-c2-participant-auth.py > c2-patch.log 2>&1
-          status=$?
-          cat c2-patch.log
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          exit 0
-      - name: Upload patch diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: c2-patch-diagnostics-${{ github.sha }}
-          path: c2-patch.log
-          if-no-files-found: error
-          retention-days: 2
-      - name: Enforce patch result
-        if: steps.patch.outputs.status != '0'
-        run: exit 1
+          python scripts/fix-c2-patch-script.py
+          python scripts/apply-c2-participant-auth.py
+          python scripts/postprocess-c2-generated.py
       - name: Compile patched Python files
         run: python -m compileall -q backend/main.py backend/sidecar.py backend/participant_auth.py backend/test_main.py backend/test_sidecar.py backend/test_participant_auth.py
-      - name: Upload patched source files
-        uses: actions/upload-artifact@v4
-        with:
-          name: c2-participant-auth-patched-files-${{ github.sha }}
-          path: |
-            backend/main.py
-            backend/sidecar.py
-            backend/test_main.py
-            backend/test_sidecar.py
-            src/App.svelte
-            README.md
-          if-no-files-found: error
-          retention-days: 2
+      - name: Commit generated files to repair branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/main.py backend/sidecar.py backend/test_main.py backend/test_sidecar.py src/App.svelte README.md
+          git commit -m "Authenticate participants before messaging"
+          git push origin HEAD:chatgpt/authenticate-participants
