@@ -713,7 +713,7 @@
     <!-- Title bar with retro gradient -->
     <header class="title-bar d-flex align-items-center justify-content-between flex-wrap gap-2 px-2 py-0">
       <!-- Left side: branding and status indicators -->
-      <div class="title-left d-flex align-items-center gap-2 flex-wrap" style="min-width: 0;">
+      <div class="title-left d-flex align-items-center gap-2 flex-wrap">
         <!-- System dot indicator -->
         <span class="window-dot flex-shrink-0" aria-hidden="true"></span>
         <!-- Title -->
@@ -943,7 +943,7 @@
             {:else}
               {#each messages as message (message.id)}
                 <div class:mine={message.isMine} class="message-row d-flex {message.isMine ? 'justify-content-end' : 'justify-content-start'}">
-                  <div class="bubble rounded p-2 text-break" style="max-width: 75%;">
+                  <div class="bubble rounded p-2 text-break">
                     <p class="message-sender fw-bold mb-1 small">{message.sender}</p>
                     <p class="mb-0">{message.text}</p>
                   </div>

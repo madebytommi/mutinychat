@@ -25,6 +25,8 @@ jobs:
       - run: npm run build
       - name: Reject external frontend runtime resources
         run: npm run check:frontend-network
+      - name: Validate Tauri content security policy
+        run: npm run check:tauri-csp
       - name: Upload frontend privacy findings
         if: failure()
         uses: actions/upload-artifact@v4
