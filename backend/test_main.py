@@ -7,13 +7,45 @@ from unittest import mock
 import nacl.exceptions
 from nacl.public import Box, PrivateKey
 
-from participant_auth import build_confirmation_payload
+from participant_auth import build_confirmation_payload, derive_safety_code
 import main as backend
+
+
+def _promote_test_channel(
+    peer_public_key: bytes,
+    role: str = "host",
+    transcript: bytes = b"t" * 32,
+) -> None:
+    if backend._private_key is None:
+        raise RuntimeError("Test local private key is missing")
+    peer_key, box = backend._create_candidate_box(
+        base64.b64encode(peer_public_key).decode("ascii"),
+        backend._private_key,
+    )
+    local_public_key = bytes(backend._private_key.public_key)
+    backend._peer_public_key = peer_key
+    backend._box = box
+    backend._connection_role = role
+    backend._handshake_transcript_hash = transcript
+    if role == "host":
+        host_key, guest_key = local_public_key, peer_key
+    else:
+        host_key, guest_key = peer_key, local_public_key
+    backend._verification_code = derive_safety_code(
+        host_key,
+        guest_key,
+        "a" * 56 + ".onion",
+        b"h" * 32,
+        b"g" * 32,
+    )
+    backend._channel_status = "confirmed"
+    backend.handshake_event.set()
 
 
 class BackendTestCase(unittest.TestCase):
     def setUp(self):
         backend.close_room()
+        backend.stop_event.clear()
 
     def tearDown(self):
         backend.close_room()
@@ -68,7 +100,7 @@ class BackendTestCase(unittest.TestCase):
         bob = PrivateKey.generate()
         backend._private_key = alice
         backend._active_room = {"onion_address": "a" * 56 + ".onion"}
-        backend._install_peer_public_key(base64.b64encode(bytes(bob.public_key)).decode("ascii"))
+        _promote_test_channel(bytes(bob.public_key))
 
         encoded = backend.encrypt_message("hello")
         raw = base64.b64decode(encoded, validate=True)
@@ -81,7 +113,7 @@ class BackendTestCase(unittest.TestCase):
         eve = PrivateKey.generate()
         backend._private_key = alice
         backend._active_room = {"onion_address": "a" * 56 + ".onion"}
-        backend._install_peer_public_key(base64.b64encode(bytes(bob.public_key)).decode("ascii"))
+        _promote_test_channel(bytes(bob.public_key))
         encoded = backend.encrypt_message("secret")
 
         with self.assertRaises(nacl.exceptions.CryptoError):
@@ -90,25 +122,42 @@ class BackendTestCase(unittest.TestCase):
     def test_malformed_peer_json_closes_session(self):
         left, right = socket.socketpair()
         try:
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
             with self.assertRaises(ValueError):
-                backend._process_peer_frame(left, b"not-json")
+                backend._process_peer_frame(left, generation, b"not-json")
         finally:
             left.close()
             right.close()
 
-    def test_peer_key_install_creates_unverified_safety_code(self):
+    def test_arbitrary_valid_length_peer_key_only_creates_pending_candidate(self):
         local = PrivateKey.generate()
         remote = PrivateKey.generate()
         backend._private_key = local
         backend._active_room = {"onion_address": "a" * 56 + ".onion"}
-        backend._install_peer_public_key(
-            base64.b64encode(bytes(remote.public_key)).decode("ascii")
+        peer_key, candidate_box = backend._create_candidate_box(
+            base64.b64encode(bytes(remote.public_key)).decode("ascii"),
+            local,
         )
-        backend._set_verification_code("host", b"h" * 32, b"g" * 32)
         state = backend.poll_messages()
-        self.assertTrue(state["encrypted"])
+        self.assertFalse(state["encrypted"])
+        self.assertEqual(bytes(remote.public_key), peer_key)
+        self.assertIsNotNone(candidate_box)
+        self.assertIsNone(backend._peer_public_key)
+        self.assertIsNone(backend._box)
+        self.assertFalse(backend.handshake_event.is_set())
         self.assertFalse(state["verified"])
-        self.assertRegex(state["verification_code"], r"^\d{5} \d{5} \d{5} \d{5}$")
+        self.assertIsNone(state["verification_code"])
+
+    def test_reflected_local_public_key_is_rejected(self):
+        local = PrivateKey.generate()
+        backend._private_key = local
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            backend._create_candidate_box(
+                base64.b64encode(bytes(local.public_key)).decode("ascii"),
+                local,
+            )
+        self.assertFalse(backend.handshake_event.is_set())
 
     def test_peer_key_install_rejects_invitation_key_mismatch(self):
         local = PrivateKey.generate()
@@ -117,45 +166,77 @@ class BackendTestCase(unittest.TestCase):
         backend._private_key = local
         backend._active_room = {"onion_address": "a" * 56 + ".onion"}
         with self.assertRaisesRegex(ValueError, "does not match"):
-            backend._install_peer_public_key(
+            backend._create_candidate_box(
                 base64.b64encode(bytes(attacker.public_key)).decode("ascii"),
+                local,
                 bytes(expected.public_key),
             )
 
     def test_message_is_blocked_until_both_participants_confirm(self):
         left, right = socket.socketpair()
         try:
-            backend.active_peer_socket = left
+            self.assertIsNotNone(backend._claim_active_peer_socket(left))
             result = backend.send_message("secret")
             self.assertEqual("error", result["status"])
             self.assertIn("safety code", result["error"])
         finally:
-            backend.active_peer_socket = None
             left.close()
             right.close()
 
     def test_encrypted_peer_confirmation_completes_verification(self):
         alice = PrivateKey.generate()
         bob = PrivateKey.generate()
-        backend._private_key = alice
-        backend._active_room = {"onion_address": "a" * 56 + ".onion"}
-        backend._install_peer_public_key(
-            base64.b64encode(bytes(bob.public_key)).decode("ascii")
-        )
-        backend._set_verification_code("host", b"h" * 32, b"g" * 32)
-        backend._verification_local_confirmed = True
-        code = backend.poll_messages()["verification_code"]
-        bob_box = Box(bob, alice.public_key)
-        ciphertext = base64.b64encode(
-            bytes(bob_box.encrypt(build_confirmation_payload(code).encode("utf-8")))
-        ).decode("ascii")
+        left, right = socket.socketpair()
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            transcript = b"t" * 32
+            _promote_test_channel(bytes(bob.public_key), "host", transcript)
+            backend._verification_local_confirmed = True
+            code = backend.poll_messages()["verification_code"]
+            bob_box = Box(bob, alice.public_key)
+            ciphertext = base64.b64encode(
+                bytes(
+                    bob_box.encrypt(
+                        build_confirmation_payload(code, "guest", transcript).encode("utf-8")
+                    )
+                )
+            ).decode("ascii")
 
-        backend._handle_peer_verification(ciphertext)
+            backend._handle_peer_verification(left, generation, ciphertext)
 
-        state = backend.poll_messages()
-        self.assertTrue(state["verified"])
-        self.assertTrue(state["verification_local_confirmed"])
-        self.assertTrue(state["verification_peer_confirmed"])
+            state = backend.poll_messages()
+            self.assertTrue(state["verified"])
+            self.assertTrue(state["verification_local_confirmed"])
+            self.assertTrue(state["verification_peer_confirmed"])
+        finally:
+            left.close()
+            right.close()
+
+    def test_reflected_local_manual_verification_is_rejected(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            transcript = b"t" * 32
+            _promote_test_channel(bytes(bob.public_key), "host", transcript)
+            code = backend.poll_messages()["verification_code"]
+            reflected = backend.encrypt_message(
+                build_confirmation_payload(code, "host", transcript)
+            )
+
+            with self.assertRaisesRegex(ValueError, "role"):
+                backend._handle_peer_verification(left, generation, reflected)
+            self.assertFalse(backend.poll_messages()["verification_peer_confirmed"])
+        finally:
+            left.close()
+            right.close()
 
     def test_verified_message_is_sent_as_ciphertext(self):
         alice = PrivateKey.generate()
@@ -164,10 +245,10 @@ class BackendTestCase(unittest.TestCase):
         try:
             backend._private_key = alice
             backend._active_room = {"onion_address": "a" * 56 + ".onion"}
-            backend._install_peer_public_key(
-                base64.b64encode(bytes(bob.public_key)).decode("ascii")
-            )
-            backend.active_peer_socket = left
+            self.assertIsNotNone(backend._claim_active_peer_socket(left))
+            _promote_test_channel(bytes(bob.public_key))
+            backend._verification_local_confirmed = True
+            backend._verification_peer_confirmed = True
             backend.verification_event.set()
 
             result = backend.send_message("secret")
@@ -181,8 +262,27 @@ class BackendTestCase(unittest.TestCase):
             ).decode("utf-8")
             self.assertEqual("secret", plaintext)
         finally:
-            backend.active_peer_socket = None
             left.close()
+            right.close()
+
+    def test_send_failure_invalidates_confirmed_channel(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        backend._private_key = alice
+        backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+        self.assertIsNotNone(backend._claim_active_peer_socket(left))
+        _promote_test_channel(bytes(bob.public_key))
+        backend.verification_event.set()
+        left.close()
+        try:
+            result = backend.send_message("secret")
+            self.assertEqual("error", result["status"])
+            state = backend.poll_messages()
+            self.assertEqual("failed", state["channel_status"])
+            self.assertFalse(state["encrypted"])
+            self.assertFalse(state["verified"])
+        finally:
             right.close()
 
     def test_raw_onion_join_is_rejected_before_network_access(self):
@@ -194,8 +294,14 @@ class BackendTestCase(unittest.TestCase):
     def test_disconnect_frame_stops_reader(self):
         left, right = socket.socketpair()
         try:
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
             self.assertFalse(
-                backend._process_peer_frame(left, json.dumps({"type": "disconnect"}).encode("utf-8"))
+                backend._process_peer_frame(
+                    left,
+                    generation,
+                    json.dumps({"type": "disconnect"}).encode("utf-8"),
+                )
             )
         finally:
             left.close()
@@ -206,12 +312,33 @@ class BackendTestCase(unittest.TestCase):
         second_left, second_right = socket.socketpair()
         try:
             self.assertTrue(backend._claim_active_peer_socket(first_left))
-            self.assertFalse(backend._claim_active_peer_socket(second_left))
+            self.assertIsNone(backend._claim_active_peer_socket(second_left))
         finally:
             first_left.close()
             first_right.close()
             second_left.close()
             second_right.close()
+
+    def test_failed_host_attempt_releases_connection_slot_for_next_peer(self):
+        failed_left, failed_right = socket.socketpair()
+        valid_left, valid_right = socket.socketpair()
+        backend._connection_mode = "host"
+        backend._active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
+        try:
+            failed_generation = backend._claim_active_peer_socket(failed_left)
+            self.assertIsNotNone(failed_generation)
+            backend._release_failed_host_connection(
+                failed_left,
+                failed_generation,
+                ValueError("bad handshake"),
+            )
+            self.assertIsNone(backend.active_peer_socket)
+            self.assertEqual("failed", backend.poll_messages()["channel_status"])
+            self.assertTrue(backend._claim_active_peer_socket(valid_left))
+        finally:
+            failed_right.close()
+            valid_left.close()
+            valid_right.close()
 
     def test_close_room_is_idempotent(self):
         self.assertEqual({"status": "closed"}, backend.close_room())

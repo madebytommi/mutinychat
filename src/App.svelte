@@ -1,6 +1,11 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import {
+    channelBadgeText,
+    mapBackendSecurityState,
+    peerVerifiedMarkerEffect
+  } from "./lib/channelStatus.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
@@ -32,8 +37,11 @@
   let toastMessage = $state("");
   let toastVisible = $state(false);
   let isEncrypted = $state(false);
+  let channelStatus = $state("disconnected");
+  let channelError = $state("");
   let isTorProtected = $state(false);
   let isPeerVerified = $state(false);
+  let identityStatus = $state("unavailable");
   let verificationCode = $state("");
   let verificationLocalConfirmed = $state(false);
   let verificationPeerConfirmed = $state(false);
@@ -61,6 +69,19 @@
     window.setTimeout(() => {
       alertVisible = false;
     }, 3200);
+  }
+
+  /** @param {Record<string, unknown> | null | undefined} payload */
+  function applySecurityState(payload) {
+    const security = mapBackendSecurityState(payload);
+    channelStatus = security.channelStatus;
+    channelError = security.channelError;
+    isEncrypted = security.isEncrypted;
+    identityStatus = security.identityStatus;
+    isPeerVerified = security.isPeerVerified;
+    verificationCode = security.verificationCode;
+    verificationLocalConfirmed = security.verificationLocalConfirmed;
+    verificationPeerConfirmed = security.verificationPeerConfirmed;
   }
 
   async function sendDisconnectSignal() {
@@ -209,12 +230,8 @@
     showCreateModal = false;
     showJoinModal = false;
     joinLinkDraft = "";
-    isEncrypted = false;
+    applySecurityState({ channel_status: "disconnected" });
     isTorProtected = false;
-    isPeerVerified = false;
-    verificationCode = "";
-    verificationLocalConfirmed = false;
-    verificationPeerConfirmed = false;
     peerCount = 0;
     shutdownRequested = false;
     currentView = "lobby";
@@ -259,7 +276,7 @@
       });
 
       backendStatus = "Room ready";
-      isEncrypted = Boolean(parsed.key_b64);
+      applySecurityState({ channel_status: "disconnected" });
       currentView = "room-ready";
       copyNotice = "";
       showCreateModal = false;
@@ -324,6 +341,8 @@
     try {
       isJoiningRoom = true;
       backendStatus = "Joining room...";
+      applySecurityState({ channel_status: "pending" });
+      connectionStatus = "Securing channel…";
       const response = await invoke("backend_ipc", {
         command: "join_room",
         message: invitation,
@@ -336,21 +355,22 @@
 
       onionAddress = String(parsed.onion_address || "");
       friendName = "Peer";
-      connectionStatus = "Verification required";
+      connectionStatus = "Identity verification required";
       messages = [];
       draft = "";
-      isEncrypted = Boolean(parsed.encrypted);
-      isPeerVerified = Boolean(parsed.verified);
-      verificationCode = String(parsed.verification_code || "");
-      verificationLocalConfirmed = false;
-      verificationPeerConfirmed = false;
+      applySecurityState(parsed);
       peerCount = 2;
       currentView = "chat";
       showJoinModal = false;
-      backendStatus = "Encrypted connection ready — compare the safety code";
+      backendStatus = "E2EE channel confirmed — compare the safety code";
       playRetroSound("door");
     } catch (error) {
       backendStatus = `Backend error: ${String(error)}`;
+      applySecurityState({
+        channel_status: "failed",
+        channel_error: String(error)
+      });
+      connectionStatus = "Secure channel failed";
       showAlert("Could not join room. Check the link and try again.");
     } finally {
       isJoiningRoom = false;
@@ -372,7 +392,8 @@
       }
       verificationLocalConfirmed = true;
       isPeerVerified = Boolean(parsed.verified);
-      connectionStatus = isPeerVerified ? "Verified" : "Waiting for peer confirmation";
+      identityStatus = isPeerVerified ? "verified" : "pending";
+      connectionStatus = isPeerVerified ? "Participant verified" : "Waiting for peer confirmation";
       backendStatus = isPeerVerified
         ? "Participant verified for this session"
         : "Your confirmation was sent — waiting for your peer";
@@ -444,9 +465,9 @@
   function startChatting() {
     messages = [];
     friendName = "Peer";
-    connectionStatus = peerCount >= 2 ? "Verification required" : "Waiting for peer";
+    connectionStatus = peerCount >= 2 ? "Identity verification required" : "Waiting for peer";
     backendStatus = peerCount >= 2
-      ? "Encrypted connection ready — compare the safety code"
+      ? "E2EE channel confirmed — compare the safety code"
       : "Waiting for a peer to join";
     currentView = "chat";
   }
@@ -467,6 +488,7 @@
 
   onMount(() => {
     let isPolling = false;
+    let pollAgainRequested = false;
     /** @type {number | null} */
     let pollTimer = null;
 
@@ -513,15 +535,15 @@
           roomName: null
         });
         const parsed = JSON.parse(String(response));
-        isEncrypted = Boolean(parsed.encrypted);
+        applySecurityState(parsed);
         isTorProtected = Boolean(parsed.tor_active);
-        isPeerVerified = Boolean(parsed.verified);
-        verificationCode = String(parsed.verification_code || "");
-        verificationLocalConfirmed = Boolean(parsed.verification_local_confirmed);
-        verificationPeerConfirmed = Boolean(parsed.verification_peer_confirmed);
         peerCount = Number(parsed.peer_count || 0);
-        if (peerCount >= 2) {
-          connectionStatus = isPeerVerified ? "Verified" : "Verification required";
+        if (channelStatus === "failed") {
+          connectionStatus = "Secure channel failed";
+        } else if (channelStatus === "pending") {
+          connectionStatus = "Securing channel…";
+        } else if (peerCount >= 2 && channelStatus === "confirmed") {
+          connectionStatus = isPeerVerified ? "Participant verified" : "Identity verification required";
         } else if (currentView !== "lobby") {
           connectionStatus = "Waiting for peer";
         }
@@ -529,40 +551,44 @@
         for (const item of items) {
           const payload = String(item);
           if (payload === "room_deleted") {
+            if (channelStatus !== "disconnected" || peerCount !== 0) continue;
             messages = [];
-            isEncrypted = false;
-            isPeerVerified = false;
-            verificationCode = "";
-            verificationLocalConfirmed = false;
-            verificationPeerConfirmed = false;
-            peerCount = 0;
             currentView = "lobby";
             showToast("Room closed – chat history erased");
             continue;
           }
 
           if (payload === "__peer_joined__") {
-            connectionStatus = "Verification required";
+            if (channelStatus !== "confirmed" || peerCount < 2) continue;
+            connectionStatus = "Identity verification required";
             playRetroSound("door");
             continue;
           }
 
           if (payload === "__peer_verified__") {
-            isPeerVerified = true;
-            connectionStatus = "Verified";
-            showToast("Participant verified for this session");
+            const effect = peerVerifiedMarkerEffect({
+              channelStatus,
+              identityStatus,
+              isPeerVerified
+            });
+            pollAgainRequested = effect.requestPoll;
+            if (effect.showNotification) {
+              showToast("Participant verified for this session");
+            }
             continue;
           }
 
           if (payload === "__peer_left__") {
-            isEncrypted = false;
-            isPeerVerified = false;
-            verificationCode = "";
-            verificationLocalConfirmed = false;
-            verificationPeerConfirmed = false;
-            peerCount = 1;
+            if (channelStatus !== "disconnected" || peerCount > 1) continue;
             connectionStatus = "Waiting for peer";
             showToast("Peer disconnected");
+            continue;
+          }
+
+          if (payload === "__channel_failed__") {
+            if (channelStatus !== "failed") continue;
+            connectionStatus = "Secure channel failed";
+            showAlert("Secure channel failed. Reconnect to try again.");
             continue;
           }
 
@@ -570,9 +596,18 @@
           playRetroSound("ding");
         }
       } catch {
-        // Ignore transient polling errors to keep UI responsive.
+        applySecurityState({
+          channel_status: "failed",
+          channel_error: "Backend connection unavailable"
+        });
+        peerCount = 0;
+        connectionStatus = "Backend unavailable";
       } finally {
         isPolling = false;
+        if (pollAgainRequested) {
+          pollAgainRequested = false;
+          void pollMessages();
+        }
       }
     };
 
@@ -672,8 +707,8 @@
         <!-- Title -->
         <span class="title-text text-nowrap">MutinyChat</span>
         <!-- E2EE encryption badge -->
-        <span class:encrypted={isEncrypted} class:verified={isPeerVerified} class="encryption-badge d-inline-block flex-shrink-0" aria-live="polite">
-          {isPeerVerified ? "✅ Verified E2EE" : isEncrypted ? "🔒 Encrypted • Unverified" : "🔓 Not Encrypted"}
+        <span class:encrypted={isEncrypted} class="encryption-badge d-inline-block flex-shrink-0" aria-live="polite">
+          {channelBadgeText(channelStatus)}
         </span>
         <!-- Tor protection badge -->
         <span class:active={isTorProtected} class="tor-badge d-inline-block flex-shrink-0" aria-live="polite">
@@ -853,10 +888,17 @@
         {:else}
           <!-- Chat view: Messages and input -->
           <section class="verification-panel alert {isPeerVerified ? 'alert-success' : 'alert-warning'} m-2 mb-0" aria-live="polite">
-            {#if isPeerVerified}
+            {#if channelStatus === "failed"}
+              <p class="fw-bold mb-1">Secure channel failed</p>
+              <p class="small mb-0">{channelError || "Reconnect to establish a new secure session."}</p>
+            {:else if channelStatus === "pending"}
+              <p class="fw-bold mb-1">Securing channel…</p>
+              <p class="small mb-0">Waiting for mutual encrypted-channel confirmation.</p>
+            {:else if isPeerVerified}
               <p class="fw-bold mb-1">✅ Participant verified for this session</p>
-              <p class="small mb-0">This only proves that both apps saw the same session keys after you compared the code.</p>
-            {:else if isEncrypted && verificationCode}
+              <p class="small mb-0">The E2EE channel is confirmed, and both participants confirmed the current session code.</p>
+            {:else if channelStatus === "confirmed" && verificationCode}
+              <p class="fw-bold mb-1">🔒 E2EE channel confirmed · participant identity unverified</p>
               <p class="fw-bold mb-1">Compare this safety code</p>
               <code class="safety-code d-block text-center my-2">{verificationCode}</code>
               <p class="small mb-2">
@@ -874,7 +916,7 @@
                 {verificationLocalConfirmed ? "Waiting for peer" : "I compared it and it matches"}
               </button>
             {:else}
-              <p class="small mb-0">Waiting for the encrypted handshake and safety code.</p>
+              <p class="small mb-0">Waiting for a peer and secure-channel confirmation.</p>
             {/if}
           </section>
 
@@ -902,10 +944,14 @@
             }}
           >
             <!-- Encryption warning if not encrypted -->
-            {#if !isEncrypted}
-              <p class="encryption-warning alert alert-warning small mb-2">🔓 Not Encrypted</p>
-            {:else if !isPeerVerified}
-              <p class="encryption-warning alert alert-warning small mb-2">🔒 Encrypted, but participant identity is not verified</p>
+            {#if channelStatus === "pending"}
+              <p class="encryption-warning alert alert-warning small mb-2">Securing channel…</p>
+            {:else if channelStatus === "failed"}
+              <p class="encryption-warning alert alert-danger small mb-2">Secure channel failed</p>
+            {:else if !isEncrypted}
+              <p class="encryption-warning alert alert-warning small mb-2">No confirmed E2EE channel</p>
+            {:else if identityStatus !== "verified"}
+              <p class="encryption-warning alert alert-warning small mb-2">E2EE channel confirmed, but participant identity is not verified</p>
             {/if}
             <!-- Input and send button -->
             <div class="d-flex gap-2">

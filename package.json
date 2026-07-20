@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json --watch",
+    "test:frontend": "node tests/frontend/channelStatus.test.js",
     "check:frontend-network": "node scripts/check-frontend-network-resources.mjs",
     "test:packaged:macos": "./scripts/test-packaged-macos.sh",
     "tauri": "tauri"
