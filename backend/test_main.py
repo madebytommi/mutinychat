@@ -271,6 +271,70 @@ class BackendTestCase(unittest.TestCase):
             left.close()
             right.close()
 
+    def test_control_sentinel_plaintext_is_delivered_only_as_chat(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        sentinels = (
+            "__disconnect__",
+            "room_deleted",
+            "__peer_joined__",
+            "__peer_left__",
+            "__peer_verified__",
+            "__channel_failed__",
+        )
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            _promote_test_channel(bytes(bob.public_key))
+            backend.verification_event.set()
+            peer_box = Box(bob, alice.public_key)
+
+            for sentinel in sentinels:
+                ciphertext = base64.b64encode(
+                    bytes(peer_box.encrypt(sentinel.encode("utf-8")))
+                ).decode("ascii")
+                frame = json.dumps(
+                    {"type": "message", "ciphertext": ciphertext},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertTrue(backend._process_peer_frame(left, generation, frame))
+
+            state = backend.poll_messages()
+            self.assertEqual(
+                [{"kind": "chat", "text": sentinel} for sentinel in sentinels],
+                state["events"],
+            )
+            self.assertTrue(backend._is_peer_session_owner(left, generation))
+        finally:
+            left.close()
+            right.close()
+
+    def test_local_disconnect_sentinel_is_sent_as_encrypted_chat(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            self.assertIsNotNone(backend._claim_active_peer_socket(left))
+            _promote_test_channel(bytes(bob.public_key))
+            backend.verification_event.set()
+
+            self.assertEqual({"status": "sent"}, backend.send_message("__disconnect__"))
+
+            frame = json.loads(right.recv(4096).split(b"\n", 1)[0].decode("utf-8"))
+            self.assertEqual("message", frame["type"])
+            plaintext = Box(bob, alice.public_key).decrypt(
+                base64.b64decode(frame["ciphertext"], validate=True)
+            ).decode("utf-8")
+            self.assertEqual("__disconnect__", plaintext)
+        finally:
+            left.close()
+            right.close()
+
     def test_send_failure_invalidates_confirmed_channel(self):
         alice = PrivateKey.generate()
         bob = PrivateKey.generate()
@@ -354,14 +418,43 @@ class BackendTestCase(unittest.TestCase):
         self.assertFalse(backend.handshake_event.is_set())
         self.assertFalse(backend.verification_event.is_set())
 
+    def test_close_room_sends_typed_disconnect_frame(self):
+        left, right = socket.socketpair()
+        self.assertIsNotNone(backend._claim_active_peer_socket(left))
+        try:
+            self.assertEqual({"status": "closed"}, backend.close_room())
+
+            frame = json.loads(right.recv(4096).split(b"\n", 1)[0].decode("utf-8"))
+            self.assertEqual({"type": "disconnect"}, frame)
+        finally:
+            left.close()
+            right.close()
+
     def test_poll_messages_drains_queue(self):
         self.assertTrue(backend._queue_frontend_message("one"))
         self.assertTrue(backend._queue_frontend_message("two"))
         first = backend.poll_messages()
         second = backend.poll_messages()
-        self.assertEqual(["one", "two"], first["messages"])
-        self.assertEqual(0, first["messages_pending"])
-        self.assertEqual([], second["messages"])
+        self.assertEqual(
+            [
+                {"kind": "chat", "text": "one"},
+                {"kind": "chat", "text": "two"},
+            ],
+            first["events"],
+        )
+        self.assertEqual(0, first["events_pending"])
+        self.assertEqual([], second["events"])
+
+    def test_frontend_control_events_are_typed_and_validated(self):
+        self.assertTrue(backend._queue_frontend_control("peer_joined"))
+        state = backend.poll_messages()
+
+        self.assertEqual(
+            [{"kind": "control", "event": "peer_joined"}],
+            state["events"],
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported frontend control event"):
+            backend._queue_frontend_control("attacker_selected_event")
 
     def test_poll_messages_returns_bounded_fifo_batches(self):
         total = backend.MAX_POLL_MESSAGES + 5
@@ -372,15 +465,21 @@ class BackendTestCase(unittest.TestCase):
         second = backend.poll_messages()
 
         self.assertEqual(
-            [f"message-{index}" for index in range(backend.MAX_POLL_MESSAGES)],
-            first["messages"],
+            [
+                {"kind": "chat", "text": f"message-{index}"}
+                for index in range(backend.MAX_POLL_MESSAGES)
+            ],
+            first["events"],
         )
-        self.assertEqual(5, first["messages_pending"])
+        self.assertEqual(5, first["events_pending"])
         self.assertEqual(
-            [f"message-{index}" for index in range(backend.MAX_POLL_MESSAGES, total)],
-            second["messages"],
+            [
+                {"kind": "chat", "text": f"message-{index}"}
+                for index in range(backend.MAX_POLL_MESSAGES, total)
+            ],
+            second["events"],
         )
-        self.assertEqual(0, second["messages_pending"])
+        self.assertEqual(0, second["events_pending"])
 
     def test_frontend_queue_enforces_message_count_limit(self):
         for index in range(backend.MAX_FRONTEND_QUEUE_MESSAGES):
@@ -391,7 +490,7 @@ class BackendTestCase(unittest.TestCase):
 
     def test_frontend_queue_enforces_serialized_byte_limit(self):
         message = "\\" * 16_000
-        serialized_size = backend._serialized_message_size(message)
+        serialized_size = backend._serialized_event_size(backend._chat_event(message))
         accepted = 0
         while backend._queue_frontend_message(message):
             accepted += 1
@@ -409,12 +508,12 @@ class BackendTestCase(unittest.TestCase):
             self.assertTrue(backend._queue_frontend_message(message))
 
         response = backend.poll_messages()
-        serialized_messages = sum(
-            backend._serialized_message_size(item) for item in response["messages"]
+        serialized_events = sum(
+            backend._serialized_event_size(event) for event in response["events"]
         )
 
-        self.assertLessEqual(serialized_messages, backend.MAX_POLL_MESSAGE_BYTES)
-        self.assertGreater(response["messages_pending"], 0)
+        self.assertLessEqual(serialized_events, backend.MAX_POLL_MESSAGE_BYTES)
+        self.assertGreater(response["events_pending"], 0)
 
     def test_oversized_peer_ciphertext_is_rejected_before_decryption(self):
         alice = PrivateKey.generate()
