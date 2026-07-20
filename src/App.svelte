@@ -6,6 +6,7 @@
     mapBackendSecurityState,
     peerVerifiedMarkerEffect
   } from "./lib/channelStatus.js";
+  import { deriveConnectionPresentation } from "./lib/connectionStatus.js";
   import {
     appendBoundedMessages,
     MAX_CHAT_MESSAGE_BYTES,
@@ -24,7 +25,6 @@
   let draft = $state("");
   let roomName = $state("sunset-chat-394");
   let onionAddress = $state("");
-  let connectionStatus = $state("Disconnected");
   let retroSoundsEnabled = $state(true);
   let backendStatus = $state("Idle");
   let currentView = $state("lobby");
@@ -59,6 +59,17 @@
   let alertMessage = $state("");
   let alertVisible = $state(false);
   let shutdownRequested = $state(false);
+  let backendAvailable = $state(true);
+  let connectionPresentation = $derived(
+    deriveConnectionPresentation({
+      backendAvailable,
+      currentView,
+      peerCount,
+      channelStatus,
+      isEncrypted,
+      identityStatus
+    })
+  );
 
   const RETRO_SOUND_PREF_KEY = "mutinychat-retro-sounds-enabled";
   const USERNAME_PREF_KEY = "mutinychat-username";
@@ -234,7 +245,6 @@
     roomName = "sunset-chat-394";
     onionAddress = "";
     friendName = "Friend Name";
-    connectionStatus = "Disconnected";
     shareLink = "";
     clearMessageHistory();
     draft = "";
@@ -356,7 +366,6 @@
       isJoiningRoom = true;
       backendStatus = "Joining room...";
       applySecurityState({ channel_status: "pending" });
-      connectionStatus = "Securing channel…";
       const response = await invoke("backend_ipc", {
         command: "join_room",
         message: invitation,
@@ -369,7 +378,6 @@
 
       onionAddress = String(parsed.onion_address || "");
       friendName = "Peer";
-      connectionStatus = "Identity verification required";
       clearMessageHistory();
       draft = "";
       applySecurityState(parsed);
@@ -384,7 +392,6 @@
         channel_status: "failed",
         channel_error: String(error)
       });
-      connectionStatus = "Secure channel failed";
       showAlert("Could not join room. Check the link and try again.");
     } finally {
       isJoiningRoom = false;
@@ -407,7 +414,6 @@
       verificationLocalConfirmed = true;
       isPeerVerified = Boolean(parsed.verified);
       identityStatus = isPeerVerified ? "verified" : "pending";
-      connectionStatus = isPeerVerified ? "Participant verified" : "Waiting for peer confirmation";
       backendStatus = isPeerVerified
         ? "Participant verified for this session"
         : "Your confirmation was sent — waiting for your peer";
@@ -477,12 +483,13 @@
   }
 
   function startChatting() {
+    if (!connectionPresentation.canHostEnterChat) {
+      backendStatus = "Waiting for a peer and confirmed secure channel";
+      return;
+    }
     clearMessageHistory();
     friendName = "Peer";
-    connectionStatus = peerCount >= 2 ? "Identity verification required" : "Waiting for peer";
-    backendStatus = peerCount >= 2
-      ? "E2EE channel confirmed — compare the safety code"
-      : "Waiting for a peer to join";
+    backendStatus = "E2EE channel confirmed — compare the safety code";
     currentView = "chat";
   }
 
@@ -547,18 +554,10 @@
           roomName: null
         });
         const parsed = JSON.parse(String(response));
+        backendAvailable = true;
         applySecurityState(parsed);
         applyTorState(parsed);
         peerCount = Number(parsed.peer_count || 0);
-        if (channelStatus === "failed") {
-          connectionStatus = "Secure channel failed";
-        } else if (channelStatus === "pending") {
-          connectionStatus = "Securing channel…";
-        } else if (peerCount >= 2 && channelStatus === "confirmed") {
-          connectionStatus = isPeerVerified ? "Participant verified" : "Identity verification required";
-        } else if (currentView !== "lobby") {
-          connectionStatus = "Waiting for peer";
-        }
         const receivedEvents = Array.isArray(parsed.events) ? parsed.events : [];
         const events = receivedEvents.slice(0, MAX_POLL_MESSAGES);
         discardedMessageCount += Math.max(0, receivedEvents.length - events.length);
@@ -582,7 +581,6 @@
 
           if (event.event === FRONTEND_CONTROL_EVENTS.PEER_JOINED) {
             if (channelStatus !== "confirmed" || peerCount < 2) continue;
-            connectionStatus = "Identity verification required";
             playRetroSound("door");
             continue;
           }
@@ -602,20 +600,19 @@
 
           if (event.event === FRONTEND_CONTROL_EVENTS.PEER_LEFT) {
             if (channelStatus !== "disconnected" || peerCount > 1) continue;
-            connectionStatus = "Waiting for peer";
             showToast("Peer disconnected");
             continue;
           }
 
           if (event.event === FRONTEND_CONTROL_EVENTS.CHANNEL_FAILED) {
             if (channelStatus !== "failed") continue;
-            connectionStatus = "Secure channel failed";
             showAlert("Secure channel failed. Reconnect to try again.");
             continue;
           }
 
         }
       } catch {
+        backendAvailable = false;
         applySecurityState({
           channel_status: "failed",
           channel_error: "Backend connection unavailable"
@@ -626,7 +623,6 @@
           error: "Backend connection unavailable"
         };
         peerCount = 0;
-        connectionStatus = "Backend unavailable";
       } finally {
         isPolling = false;
         if (pollAgainRequested) {
@@ -795,7 +791,7 @@
         <!-- Buddy card showing current connection status -->
         <div class="buddy-card card card-sm flex-shrink-0 mb-2">
           <div class="card-body p-2 d-flex align-items-center gap-2">
-            <span class:status-online={peerCount >= 2} class="status-dot flex-shrink-0" aria-hidden="true"></span>
+            <span class:status-online={connectionPresentation.confirmedPeer} class="status-dot flex-shrink-0" aria-hidden="true"></span>
             <span class="buddy-text text-truncate">{friendName}</span>
           </div>
         </div>
@@ -803,14 +799,14 @@
         <!-- Connection status indicator -->
         <p class="connection-label mb-2 small text-nowrap d-flex align-items-center gap-1">
           Status:
-          <span class:status-connected={isPeerVerified} class="connection-state fw-bold flex-shrink-0">
-            {connectionStatus}
+          <span class:status-connected={connectionPresentation.verifiedPeer} class="connection-state fw-bold flex-shrink-0">
+            {connectionPresentation.statusText}
           </span>
         </p>
 
         <!-- Room lifecycle status -->
         <p class="room-lifecycle-status small mb-2 p-2 text-center">
-          {peerCount >= 2 ? "2/2 connected - verify before chatting" : "1/2 connected - waiting for peer"}
+          {connectionPresentation.occupancyText}
         </p>
 
         <!-- Ephemeral messages note -->
@@ -910,10 +906,21 @@
               <p class="room-note alert alert-success small mb-2">{copyNotice}</p>
             {/if}
 
+            <p class="room-note alert alert-info small mb-2" aria-live="polite">
+              {connectionPresentation.occupancyText}
+            </p>
+
             <!-- Action buttons -->
             <div class="room-ready-actions d-flex gap-2 flex-wrap justify-content-center w-100">
               <button class="modal-btn btn btn-secondary" type="button" onclick={copyShareLink}>Copy Link</button>
-              <button class="modal-btn btn btn-primary" type="button" onclick={startChatting}>Start Chatting</button>
+              <button
+                class="modal-btn btn btn-primary"
+                type="button"
+                onclick={startChatting}
+                disabled={!connectionPresentation.canHostEnterChat}
+              >
+                {connectionPresentation.canHostEnterChat ? "Continue to verification" : "Waiting for peer..."}
+              </button>
             </div>
           </section>
 
