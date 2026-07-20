@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BackendDir = Join-Path $Root "backend"
-$EntryPoint = Join-Path $BackendDir "sidecar.py"
+$EntryPoint = Join-Path $BackendDir "main.py"
 $LockFile = Join-Path $BackendDir "requirements-windows.lock"
 $VenvDir = Join-Path $Root ".venv-windows-build"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"

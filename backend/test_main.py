@@ -231,6 +231,47 @@ class BackendTestCase(unittest.TestCase):
             left.close()
             right.close()
 
+    @mock.patch.object(backend, "_perform_handshake", side_effect=RuntimeError("failed"))
+    def test_host_peer_count_is_not_promoted_when_handshake_fails(self, _perform_handshake):
+        left, right = socket.socketpair()
+        backend._connection_mode = "host"
+        backend._active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
+        backend._peer_count = 1
+        try:
+            backend._handle_guest(left)
+
+            self.assertEqual(1, backend._peer_count)
+            self.assertIsNone(backend.active_peer_socket)
+        finally:
+            left.close()
+            right.close()
+
+    @mock.patch.object(backend, "_peer_session")
+    @mock.patch.object(backend, "_perform_handshake")
+    def test_host_peer_count_is_promoted_after_shared_handshake_succeeds(
+        self,
+        _perform_handshake,
+        peer_session,
+    ):
+        left, right = socket.socketpair()
+        backend._connection_mode = "host"
+        backend._active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
+        backend._peer_count = 1
+        try:
+            backend._handle_guest(left)
+
+            _perform_handshake.assert_called_once()
+            self.assertEqual(2, backend._peer_count)
+            peer_session.assert_called_once_with(
+                left,
+                "host",
+                mock.ANY,
+                handshake_complete=True,
+            )
+        finally:
+            left.close()
+            right.close()
+
     def test_arbitrary_valid_length_peer_key_only_creates_pending_candidate(self):
         local = PrivateKey.generate()
         remote = PrivateKey.generate()
