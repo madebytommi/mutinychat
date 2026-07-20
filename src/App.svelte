@@ -6,6 +6,12 @@
     mapBackendSecurityState,
     peerVerifiedMarkerEffect
   } from "./lib/channelStatus.js";
+  import {
+    appendBoundedMessages,
+    MAX_CHAT_MESSAGE_BYTES,
+    MAX_POLL_MESSAGES,
+    utf8ByteLength
+  } from "./lib/messageHistory.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
@@ -34,6 +40,8 @@
   let chatAreaEl = $state();
   /** @type {ChatMessage[]} */
   let messages = $state([]);
+  let discardedMessageCount = $state(0);
+  let nextMessageId = 1;
   let toastMessage = $state("");
   let toastVisible = $state(false);
   let isEncrypted = $state(false);
@@ -97,27 +105,34 @@
   }
 
 
+  function clearMessageHistory() {
+    messages = [];
+    discardedMessageCount = 0;
+  }
+
   /** @param {string} text @param {boolean} isMine @param {string} [sender] */
   function addMessage(text, isMine, sender) {
     const cleanText = String(text).trim();
-    if (!cleanText) return;
-    const normalizedSender = String(sender || (isMine ? myUsername : friendName)).trim() || (isMine ? "You" : "Friend");
-
-    messages = [
-      ...messages,
+    if (!cleanText) return false;
+    const normalizedSender = (String(sender || (isMine ? myUsername : friendName)).trim() || (isMine ? "You" : "Friend")).slice(0, 80);
+    const result = appendBoundedMessages(messages, [
       {
-        id: Date.now() + Math.floor(Math.random() * 1000),
+        id: nextMessageId++,
         text: cleanText,
         isMine,
         sender: normalizedSender
       }
-    ];
+    ]);
+    messages = result.messages;
+    discardedMessageCount += result.removedCount + result.rejectedCount;
+    if (result.rejectedCount > 0) return false;
 
     queueMicrotask(() => {
       if (chatAreaEl) {
         chatAreaEl.scrollTop = chatAreaEl.scrollHeight;
       }
     });
+    return true;
   }
 
   async function sendMessage() {
@@ -132,6 +147,10 @@
 
     const text = draft.trim();
     if (!text) return;
+    if (utf8ByteLength(text) > MAX_CHAT_MESSAGE_BYTES) {
+      showAlert(`Messages are limited to ${MAX_CHAT_MESSAGE_BYTES / 1024} KiB.`);
+      return;
+    }
 
     try {
       const result = await invoke("backend_ipc", {
@@ -222,7 +241,7 @@
     friendName = "Friend Name";
     connectionStatus = "Disconnected";
     shareLink = "";
-    messages = [];
+    clearMessageHistory();
     draft = "";
     roomDraftName = "";
     copyNotice = "";
@@ -356,7 +375,7 @@
       onionAddress = String(parsed.onion_address || "");
       friendName = "Peer";
       connectionStatus = "Identity verification required";
-      messages = [];
+      clearMessageHistory();
       draft = "";
       applySecurityState(parsed);
       peerCount = 2;
@@ -463,7 +482,7 @@
   }
 
   function startChatting() {
-    messages = [];
+    clearMessageHistory();
     friendName = "Peer";
     connectionStatus = peerCount >= 2 ? "Identity verification required" : "Waiting for peer";
     backendStatus = peerCount >= 2
@@ -547,12 +566,14 @@
         } else if (currentView !== "lobby") {
           connectionStatus = "Waiting for peer";
         }
-        const items = Array.isArray(parsed.messages) ? parsed.messages : [];
+        const receivedItems = Array.isArray(parsed.messages) ? parsed.messages : [];
+        const items = receivedItems.slice(0, MAX_POLL_MESSAGES);
+        discardedMessageCount += Math.max(0, receivedItems.length - items.length);
         for (const item of items) {
           const payload = String(item);
           if (payload === "room_deleted") {
             if (channelStatus !== "disconnected" || peerCount !== 0) continue;
-            messages = [];
+            clearMessageHistory();
             currentView = "lobby";
             showToast("Room closed – chat history erased");
             continue;
@@ -592,8 +613,9 @@
             continue;
           }
 
-          addMessage(payload, false);
-          playRetroSound("ding");
+          if (addMessage(payload, false)) {
+            playRetroSound("ding");
+          }
         }
       } catch {
         applySecurityState({
@@ -921,6 +943,11 @@
           </section>
 
           <div class="chat-area flex-grow-1 d-flex flex-column gap-2 overflow-auto p-3" aria-label="Chat messages" bind:this={chatAreaEl}>
+            {#if discardedMessageCount > 0}
+              <p class="history-limit-note small text-muted text-center mb-1">
+                {discardedMessageCount} older or oversized {discardedMessageCount === 1 ? "message was" : "messages were"} removed to keep this session responsive.
+              </p>
+            {/if}
             {#if messages.length === 0}
               <p class="empty-chat small text-muted text-center">No messages yet. Type below to test local send logging.</p>
             {:else}
@@ -960,6 +987,7 @@
                 type="text"
                 placeholder={isPeerVerified ? "Type a message..." : "Verify the safety code first"}
                 bind:value={draft}
+                maxlength={MAX_CHAT_MESSAGE_BYTES}
                 onkeydown={handleInputKeydown}
                 disabled={!isPeerVerified}
               />

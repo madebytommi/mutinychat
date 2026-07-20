@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -10,6 +10,7 @@ use tauri::Manager;
 use std::os::windows::process::CommandExt;
 
 const MAX_BACKEND_OUTPUT_LINES: usize = 20;
+const MAX_BACKEND_OUTPUT_LINE_BYTES: usize = 512 * 1024;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -17,6 +18,45 @@ struct BackendSession {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Result<usize> {
+    output.clear();
+    loop {
+        let (bytes_to_consume, found_newline, overflowed) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(output.len());
+            }
+
+            let newline_position = available.iter().position(|byte| *byte == b'\n');
+            let candidate_bytes = newline_position
+                .map(|position| position + 1)
+                .unwrap_or(available.len());
+            let remaining_capacity = MAX_BACKEND_OUTPUT_LINE_BYTES.saturating_sub(output.len());
+            let bytes_to_copy = candidate_bytes.min(remaining_capacity);
+            output.extend_from_slice(&available[..bytes_to_copy]);
+            (
+                bytes_to_copy,
+                newline_position.is_some() && bytes_to_copy == candidate_bytes,
+                candidate_bytes > remaining_capacity,
+            )
+        };
+
+        reader.consume(bytes_to_consume);
+        if overflowed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Backend output line exceeds the {} KiB limit",
+                    MAX_BACKEND_OUTPUT_LINE_BYTES / 1024
+                ),
+            ));
+        }
+        if found_newline {
+            return Ok(output.len());
+        }
+    }
 }
 
 impl BackendSession {
@@ -59,19 +99,18 @@ impl BackendSession {
             .flush()
             .map_err(|err| format!("Failed flushing backend stdin: {err}"))?;
 
-        let mut response_line = String::new();
+        let mut response_line = Vec::new();
         for _ in 0..MAX_BACKEND_OUTPUT_LINES {
-            response_line.clear();
-            let read = self
-                .stdout
-                .read_line(&mut response_line)
+            let read = read_bounded_line(&mut self.stdout, &mut response_line)
                 .map_err(|err| format!("Failed reading backend stdout: {err}"))?;
 
             if read == 0 {
                 return Err("Backend process exited unexpectedly".to_string());
             }
 
-            let trimmed = response_line.trim();
+            let response_text = std::str::from_utf8(&response_line)
+                .map_err(|err| format!("Backend output is not valid UTF-8: {err}"))?;
+            let trimmed = response_text.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -80,7 +119,8 @@ impl BackendSession {
                 Ok(serde_json::Value::Object(_)) => return Ok(trimmed.to_string()),
                 Ok(_) => continue,
                 Err(_) => {
-                    eprintln!("Ignoring non-JSON backend output: {trimmed}");
+                    let preview: String = trimmed.chars().take(200).collect();
+                    eprintln!("Ignoring non-JSON backend output: {preview}");
                 }
             }
         }
@@ -313,4 +353,58 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![backend_ipc])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_bounded_line, MAX_BACKEND_OUTPUT_LINE_BYTES};
+    use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn bounded_line_reader_accepts_normal_json() {
+        let mut reader = Cursor::new(b"{\"status\":\"ok\"}\nnext\n".to_vec());
+        let mut output = Vec::new();
+
+        let read = read_bounded_line(&mut reader, &mut output).expect("line should be accepted");
+
+        assert_eq!(read, output.len());
+        assert_eq!(b"{\"status\":\"ok\"}\n", output.as_slice());
+    }
+
+    #[test]
+    fn bounded_line_reader_accepts_exact_limit_including_newline() {
+        let mut input = vec![b'x'; MAX_BACKEND_OUTPUT_LINE_BYTES - 1];
+        input.push(b'\n');
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let read = read_bounded_line(&mut reader, &mut output).expect("boundary line should pass");
+
+        assert_eq!(MAX_BACKEND_OUTPUT_LINE_BYTES, read);
+        assert_eq!(MAX_BACKEND_OUTPUT_LINE_BYTES, output.len());
+    }
+
+    #[test]
+    fn bounded_line_reader_rejects_oversized_line_without_growing_past_limit() {
+        let mut input = vec![b'x'; MAX_BACKEND_OUTPUT_LINE_BYTES];
+        input.extend_from_slice(b"x\n");
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let error =
+            read_bounded_line(&mut reader, &mut output).expect_err("line should be rejected");
+
+        assert_eq!(ErrorKind::InvalidData, error.kind());
+        assert_eq!(MAX_BACKEND_OUTPUT_LINE_BYTES, output.len());
+    }
+
+    #[test]
+    fn bounded_line_reader_handles_eof_without_newline() {
+        let mut reader = Cursor::new(b"{\"status\":\"ok\"}".to_vec());
+        let mut output = Vec::new();
+
+        let read = read_bounded_line(&mut reader, &mut output).expect("EOF line should pass");
+
+        assert_eq!(b"{\"status\":\"ok\"}".len(), read);
+    }
 }

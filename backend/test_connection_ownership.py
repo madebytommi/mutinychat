@@ -153,6 +153,55 @@ class ConnectionOwnershipTestCase(unittest.TestCase):
         self.assertTrue(state["encrypted"])
         self.assertEqual([], state["messages"])
 
+    def test_stale_decrypted_message_cannot_clear_new_connection_queue(self):
+        old_conn, _ = self._socket_pair()
+        old_generation = self._claim(old_conn)
+        self._set_owned_channel(old_conn, old_generation, verified=True)
+        old_box = backend._box
+        self.assertIsNotNone(old_box)
+        raw = json.dumps(
+            {
+                "type": "message",
+                "ciphertext": backend._encrypt_with_box(old_box, "stale message"),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        decrypt_entered = threading.Event()
+        release_decrypt = threading.Event()
+        original_decrypt = backend._decrypt_with_box
+        results: list[bool] = []
+
+        def blocked_decrypt(*args, **kwargs):
+            decrypt_entered.set()
+            self.assertTrue(release_decrypt.wait(2))
+            return original_decrypt(*args, **kwargs)
+
+        with mock.patch.object(backend, "_decrypt_with_box", side_effect=blocked_decrypt):
+            thread, failures = self._start_thread(
+                lambda: results.append(
+                    backend._process_peer_frame(old_conn, old_generation, raw)
+                )
+            )
+            self.assertTrue(decrypt_entered.wait(2))
+            backend._fail_active_channel(
+                old_conn,
+                old_generation,
+                ConnectionError("old connection released"),
+            )
+            backend.poll_messages()
+            new_conn, _ = self._socket_pair()
+            new_generation = self._claim(new_conn)
+            self._set_owned_channel(new_conn, new_generation, verified=True)
+            self.assertTrue(backend._queue_frontend_message("new session message"))
+            release_decrypt.set()
+            self._join(thread)
+
+        self.assertEqual([], failures)
+        self.assertEqual([False], results)
+        state = backend.poll_messages()
+        self.assertEqual("confirmed", state["channel_status"])
+        self.assertEqual(["new session message"], state["messages"])
+
     def test_old_peer_session_finally_cannot_clear_new_connection(self):
         old_conn, _ = self._socket_pair()
         old_generation = self._claim(old_conn)
