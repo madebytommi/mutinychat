@@ -83,6 +83,101 @@ class BackendTestCase(unittest.TestCase):
             backend.handle_json_command({"cmd": "echo", "message": "hello"}),
         )
 
+    def test_poll_reports_live_tor_without_overstating_room_routing(self):
+        controller = mock.MagicMock()
+        controller.is_alive.return_value = True
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        backend.tor_controller = controller
+        backend.tor_process = process
+
+        ready = backend.poll_messages()
+
+        self.assertEqual("ready", ready["tor_status"])
+        self.assertIsNone(ready["tor_error"])
+        self.assertFalse(ready["tor_route_active"])
+        self.assertNotIn("tor_active", ready)
+
+    def test_poll_requires_live_process_and_controller_for_tor_status(self):
+        controller = mock.MagicMock()
+        controller.is_alive.return_value = True
+        process = mock.MagicMock()
+        process.poll.return_value = 1
+        backend.tor_controller = controller
+        backend.tor_process = process
+        backend._active_room = {
+            "mode": "guest",
+            "tor_generation": backend._tor_generation,
+        }
+        backend._connection_mode = "guest"
+
+        stopped = backend.poll_messages()
+
+        self.assertEqual("failed", stopped["tor_status"])
+        self.assertIn("no longer running", stopped["tor_error"])
+        self.assertFalse(stopped["tor_route_active"])
+
+        process.poll.return_value = None
+        controller.is_alive.return_value = False
+        disconnected = backend.poll_messages()
+        self.assertEqual("failed", disconnected["tor_status"])
+        self.assertIn("control connection", disconnected["tor_error"])
+        self.assertFalse(disconnected["tor_route_active"])
+
+    def test_room_route_is_bound_to_the_live_tor_generation(self):
+        controller = mock.MagicMock()
+        controller.is_alive.return_value = True
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        backend.tor_controller = controller
+        backend.tor_process = process
+        backend._connection_mode = "host"
+        backend._active_room = {
+            "mode": "host",
+            "tor_generation": backend._tor_generation,
+        }
+
+        current = backend.poll_messages()
+        self.assertTrue(current["tor_route_active"])
+
+        backend._active_room["tor_generation"] = backend._tor_generation - 1
+        stale = backend.poll_messages()
+        self.assertEqual("ready", stale["tor_status"])
+        self.assertFalse(stale["tor_route_active"])
+
+    @mock.patch.object(backend.Controller, "from_port")
+    @mock.patch.object(backend.stem.process, "launch_tor_with_config")
+    @mock.patch.object(backend, "_resolve_tor_cmd", return_value="tor")
+    def test_start_tor_replaces_stale_runtime(
+        self,
+        _resolve_tor_cmd,
+        launch_tor_with_config,
+        from_port,
+    ):
+        stale_controller = mock.MagicMock()
+        stale_controller.is_alive.return_value = False
+        stale_process = mock.MagicMock()
+        stale_process.poll.return_value = 1
+        backend.tor_controller = stale_controller
+        backend.tor_process = stale_process
+
+        new_controller = mock.MagicMock()
+        new_controller.is_alive.return_value = True
+        new_process = mock.MagicMock()
+        new_process.poll.return_value = None
+        launch_tor_with_config.return_value = new_process
+        from_port.return_value = new_controller
+        previous_generation = backend._tor_generation
+
+        result = backend.start_tor()
+
+        self.assertIs(new_controller, result)
+        self.assertIs(new_controller, backend.tor_controller)
+        self.assertEqual(previous_generation + 1, backend._tor_generation)
+        stale_controller.close.assert_called_once()
+        stale_process.terminate.assert_called_once()
+        new_controller.authenticate.assert_called_once()
+
     def test_empty_message_is_rejected(self):
         self.assertEqual(
             {"status": "error", "error": "Message cannot be empty"},
@@ -625,6 +720,7 @@ class BackendTestCase(unittest.TestCase):
         close_room.assert_called_once()
         self.assertEqual("host", backend._connection_mode)
         self.assertEqual(1, backend._peer_count)
+        self.assertEqual(backend._tor_generation, backend._active_room["tor_generation"])
         self.assertEqual("test-room", response["friendly_name"])
         self.assertTrue(response["share_link"].startswith("mutinychat://join?"))
         self.assertNotIn("key_b64", response)
