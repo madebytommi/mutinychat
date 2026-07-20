@@ -12,6 +12,7 @@
     MAX_POLL_MESSAGES,
     utf8ByteLength
   } from "./lib/messageHistory.js";
+  import { FRONTEND_CONTROL_EVENTS, parseFrontendEvent } from "./lib/frontendEvents.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
@@ -91,19 +92,6 @@
     verificationLocalConfirmed = security.verificationLocalConfirmed;
     verificationPeerConfirmed = security.verificationPeerConfirmed;
   }
-
-  async function sendDisconnectSignal() {
-    try {
-      await invoke("backend_ipc", {
-        command: "send_message",
-        message: "__disconnect__",
-        roomName: null
-      });
-    } catch {
-      // Best-effort disconnect during shutdown/room close.
-    }
-  }
-
 
   function clearMessageHistory() {
     messages = [];
@@ -226,7 +214,6 @@
   async function closeRoomFromFrontend() {
     try {
       backendStatus = "Closing room...";
-      await sendDisconnectSignal();
       await invoke("backend_ipc", {
         command: "close_room",
         message: null,
@@ -512,12 +499,10 @@
     let pollTimer = null;
 
     const handleBeforeUnload = () => {
-      void sendDisconnectSignal();
       void requestGracefulShutdown();
     };
 
     const handlePageHide = () => {
-      void sendDisconnectSignal();
       void requestGracefulShutdown();
     };
 
@@ -566,12 +551,20 @@
         } else if (currentView !== "lobby") {
           connectionStatus = "Waiting for peer";
         }
-        const receivedItems = Array.isArray(parsed.messages) ? parsed.messages : [];
-        const items = receivedItems.slice(0, MAX_POLL_MESSAGES);
-        discardedMessageCount += Math.max(0, receivedItems.length - items.length);
-        for (const item of items) {
-          const payload = String(item);
-          if (payload === "room_deleted") {
+        const receivedEvents = Array.isArray(parsed.events) ? parsed.events : [];
+        const events = receivedEvents.slice(0, MAX_POLL_MESSAGES);
+        discardedMessageCount += Math.max(0, receivedEvents.length - events.length);
+        for (const rawEvent of events) {
+          const event = parseFrontendEvent(rawEvent);
+          if (!event) continue;
+          if (event.kind === "chat") {
+            if (addMessage(event.text, false)) {
+              playRetroSound("ding");
+            }
+            continue;
+          }
+
+          if (event.event === FRONTEND_CONTROL_EVENTS.ROOM_DELETED) {
             if (channelStatus !== "disconnected" || peerCount !== 0) continue;
             clearMessageHistory();
             currentView = "lobby";
@@ -579,14 +572,14 @@
             continue;
           }
 
-          if (payload === "__peer_joined__") {
+          if (event.event === FRONTEND_CONTROL_EVENTS.PEER_JOINED) {
             if (channelStatus !== "confirmed" || peerCount < 2) continue;
             connectionStatus = "Identity verification required";
             playRetroSound("door");
             continue;
           }
 
-          if (payload === "__peer_verified__") {
+          if (event.event === FRONTEND_CONTROL_EVENTS.PEER_VERIFIED) {
             const effect = peerVerifiedMarkerEffect({
               channelStatus,
               identityStatus,
@@ -599,23 +592,20 @@
             continue;
           }
 
-          if (payload === "__peer_left__") {
+          if (event.event === FRONTEND_CONTROL_EVENTS.PEER_LEFT) {
             if (channelStatus !== "disconnected" || peerCount > 1) continue;
             connectionStatus = "Waiting for peer";
             showToast("Peer disconnected");
             continue;
           }
 
-          if (payload === "__channel_failed__") {
+          if (event.event === FRONTEND_CONTROL_EVENTS.CHANNEL_FAILED) {
             if (channelStatus !== "failed") continue;
             connectionStatus = "Secure channel failed";
             showAlert("Secure channel failed. Reconnect to try again.");
             continue;
           }
 
-          if (addMessage(payload, false)) {
-            playRetroSound("ding");
-          }
         }
       } catch {
         applySecurityState({

@@ -151,7 +151,7 @@ class ConnectionOwnershipTestCase(unittest.TestCase):
         state = backend.poll_messages()
         self.assertEqual("confirmed", state["channel_status"])
         self.assertTrue(state["encrypted"])
-        self.assertEqual([], state["messages"])
+        self.assertEqual([], state["events"])
 
     def test_stale_decrypted_message_cannot_clear_new_connection_queue(self):
         old_conn, _ = self._socket_pair()
@@ -200,7 +200,10 @@ class ConnectionOwnershipTestCase(unittest.TestCase):
         self.assertEqual([False], results)
         state = backend.poll_messages()
         self.assertEqual("confirmed", state["channel_status"])
-        self.assertEqual(["new session message"], state["messages"])
+        self.assertEqual(
+            [{"kind": "chat", "text": "new session message"}],
+            state["events"],
+        )
 
     def test_old_peer_session_finally_cannot_clear_new_connection(self):
         old_conn, _ = self._socket_pair()

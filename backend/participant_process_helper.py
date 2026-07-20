@@ -21,8 +21,11 @@ WAIT_SECONDS = 8
 def _wait_for_message(expected: str) -> bool:
     deadline = time.monotonic() + WAIT_SECONDS
     while time.monotonic() < deadline:
-        messages = backend.poll_messages()["messages"]
-        if expected in messages:
+        events = backend.poll_messages()["events"]
+        if any(
+            event.get("kind") == "chat" and event.get("text") == expected
+            for event in events
+        ):
             return True
         time.sleep(0.02)
     return False

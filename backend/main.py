@@ -58,6 +58,15 @@ MAX_FRONTEND_QUEUE_ITEM_BYTES = 128 * 1024
 MAX_POLL_MESSAGES = 32
 MAX_POLL_MESSAGE_BYTES = 128 * 1024
 MAX_ERROR_MESSAGE_CHARS = 512
+FRONTEND_CONTROL_EVENTS = frozenset(
+    {
+        "channel_failed",
+        "peer_joined",
+        "peer_left",
+        "peer_verified",
+        "room_deleted",
+    }
+)
 ONION_V3_RE = re.compile(r"(?<![a-z2-7])([a-z2-7]{56}\.onion)(?![a-z2-7.])", re.I)
 
 state_lock = threading.RLock()
@@ -93,7 +102,7 @@ _verification_peer_confirmed = False
 _peer_count = 0
 _active_room: Optional[dict[str, Any]] = None
 _connection_mode: Optional[str] = None
-_inbox: deque[tuple[str, int]] = deque()
+_inbox: deque[tuple[dict[str, str], int]] = deque()
 _inbox_bytes = 0
 
 ADJECTIVES = ["midnight", "pixel", "sunset", "neon", "velvet", "silver", "echo", "lunar"]
@@ -635,7 +644,7 @@ def _mark_verified_if_complete(conn: socket.socket, generation: int) -> bool:
                     became_verified = True
             verified = verification_event.is_set()
     if became_verified:
-        _queue_frontend_message("__peer_verified__")
+        _queue_frontend_control("peer_verified")
     return verified
 
 
@@ -715,8 +724,18 @@ def confirm_verification() -> dict[str, Any]:
     }
 
 
-def _serialized_message_size(message: str) -> int:
-    return len(json.dumps(message, separators=(",", ":")).encode("utf-8"))
+def _chat_event(message: str) -> dict[str, str]:
+    return {"kind": "chat", "text": message}
+
+
+def _control_event(name: str) -> dict[str, str]:
+    if name not in FRONTEND_CONTROL_EVENTS:
+        raise ValueError(f"Unsupported frontend control event: {name}")
+    return {"kind": "control", "event": name}
+
+
+def _serialized_event_size(event: dict[str, str]) -> int:
+    return len(json.dumps(event, separators=(",", ":")).encode("utf-8"))
 
 
 def _clear_frontend_messages() -> None:
@@ -726,9 +745,9 @@ def _clear_frontend_messages() -> None:
         _inbox_bytes = 0
 
 
-def _queue_frontend_message(message: str) -> bool:
+def _queue_frontend_event(event: dict[str, str]) -> bool:
     global _inbox_bytes
-    serialized_bytes = _serialized_message_size(message)
+    serialized_bytes = _serialized_event_size(event)
     if serialized_bytes > MAX_FRONTEND_QUEUE_ITEM_BYTES:
         return False
     with inbox_lock:
@@ -737,9 +756,17 @@ def _queue_frontend_message(message: str) -> bool:
             or _inbox_bytes + serialized_bytes > MAX_FRONTEND_QUEUE_BYTES
         ):
             return False
-        _inbox.append((message, serialized_bytes))
+        _inbox.append((event, serialized_bytes))
         _inbox_bytes += serialized_bytes
         return True
+
+
+def _queue_frontend_message(message: str) -> bool:
+    return _queue_frontend_event(_chat_event(message))
+
+
+def _queue_frontend_control(name: str) -> bool:
+    return _queue_frontend_event(_control_event(name))
 
 
 def _claim_active_peer_socket(conn: socket.socket) -> Optional[int]:
@@ -802,7 +829,7 @@ def _fail_active_channel(conn: socket.socket, generation: int, exc: Exception) -
             failed_owned_session = True
     _close_socket(conn)
     if failed_owned_session and not stop_event.is_set():
-        _queue_frontend_message("__channel_failed__")
+        _queue_frontend_control("channel_failed")
     return failed_owned_session
 
 
@@ -837,8 +864,6 @@ def _process_peer_frame(conn: socket.socket, generation: int, raw: bytes) -> boo
         plaintext = _decrypt_with_box(box, ciphertext)
         if len(plaintext.encode("utf-8")) > MAX_CHAT_MESSAGE_BYTES:
             raise ValueError("Peer chat message is too large")
-        if plaintext == "__disconnect__":
-            return False
         with peer_lock:
             if not _is_peer_session_owner_locked(conn, generation):
                 return False
@@ -961,20 +986,20 @@ def _peer_session(
                             channel_status=final_channel_status,
                             channel_error=final_channel_error,
                         )
-                        notification = "__channel_failed__" if failed else "__peer_left__"
+                        notification = "channel_failed" if failed else "peer_left"
                     elif mode == "guest" and _connection_mode == "guest":
                         _peer_count = 0
                         _active_room = None
                         _connection_mode = None
                         _clear_crypto(final_channel_status, final_channel_error)
-                        notification = "__channel_failed__" if failed else "room_deleted"
+                        notification = "channel_failed" if failed else "room_deleted"
                 active_peer_socket = None
                 _active_peer_generation = None
                 if guest_socket is conn:
                     guest_socket = None
         _close_socket(conn)
         if notification is not None and not stop_event.is_set():
-            _queue_frontend_message(notification)
+            _queue_frontend_control(notification)
 
 
 def _handle_guest(conn: socket.socket) -> None:
@@ -999,7 +1024,7 @@ def _handle_guest(conn: socket.socket) -> None:
             return
         with state_lock:
             _peer_count = 2
-        _queue_frontend_message("__peer_joined__")
+        _queue_frontend_control("peer_joined")
     _peer_session(conn, "host", generation, handshake_complete=True)
 
 
@@ -1252,17 +1277,17 @@ def build_room_response(room_name: str) -> dict[str, Any]:
 def poll_messages() -> dict[str, Any]:
     global _inbox_bytes
     with inbox_lock:
-        messages: list[str] = []
-        message_bytes = 0
-        while _inbox and len(messages) < MAX_POLL_MESSAGES:
-            message, serialized_bytes = _inbox[0]
-            if messages and message_bytes + serialized_bytes > MAX_POLL_MESSAGE_BYTES:
+        events: list[dict[str, str]] = []
+        event_bytes = 0
+        while _inbox and len(events) < MAX_POLL_MESSAGES:
+            event, serialized_bytes = _inbox[0]
+            if events and event_bytes + serialized_bytes > MAX_POLL_MESSAGE_BYTES:
                 break
             _inbox.popleft()
             _inbox_bytes -= serialized_bytes
-            messages.append(message)
-            message_bytes += serialized_bytes
-        messages_pending = len(_inbox)
+            events.append(event)
+            event_bytes += serialized_bytes
+        events_pending = len(_inbox)
     with state_lock:
         channel_status = _channel_status
         encrypted = (
@@ -1284,8 +1309,8 @@ def poll_messages() -> dict[str, Any]:
         else:
             identity_status = "unverified"
     return {
-        "messages": messages,
-        "messages_pending": messages_pending,
+        "events": events,
+        "events_pending": events_pending,
         "channel_status": channel_status,
         "channel_error": channel_error,
         "encrypted": encrypted,
