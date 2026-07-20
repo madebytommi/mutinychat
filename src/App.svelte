@@ -7,6 +7,7 @@
     peerVerifiedMarkerEffect
   } from "./lib/channelStatus.js";
   import { deriveConnectionPresentation } from "./lib/connectionStatus.js";
+  import { isBackendPollBusy } from "./lib/backendPoll.js";
   import {
     appendBoundedMessages,
     MAX_CHAT_MESSAGE_BYTES,
@@ -554,6 +555,7 @@
           roomName: null
         });
         const parsed = JSON.parse(String(response));
+        if (isBackendPollBusy(parsed)) return;
         backendAvailable = true;
         applySecurityState(parsed);
         applyTorState(parsed);

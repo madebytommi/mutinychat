@@ -1,7 +1,10 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock, TryLockError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tauri::Manager;
@@ -11,13 +14,22 @@ use std::os::windows::process::CommandExt;
 
 const MAX_BACKEND_OUTPUT_LINES: usize = 20;
 const MAX_BACKEND_OUTPUT_LINE_BYTES: usize = 512 * 1024;
+const BACKEND_REQUEST_QUEUE_CAPACITY: usize = 1;
+const BACKEND_POLL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKEND_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const BACKEND_TOR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+struct BackendRequest {
+    payload: String,
+    response_sender: SyncSender<Result<String, String>>,
+}
+
 struct BackendSession {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    request_sender: Option<SyncSender<BackendRequest>>,
 }
 
 fn read_bounded_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Result<usize> {
@@ -59,6 +71,85 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Re
     }
 }
 
+fn exchange_backend_command<W: Write, R: BufRead>(
+    stdin: &mut W,
+    stdout: &mut R,
+    payload: &str,
+) -> Result<String, String> {
+    writeln!(stdin, "{payload}")
+        .map_err(|err| format!("Failed writing JSON command to backend stdin: {err}"))?;
+    stdin
+        .flush()
+        .map_err(|err| format!("Failed flushing backend stdin: {err}"))?;
+
+    let mut response_line = Vec::new();
+    for _ in 0..MAX_BACKEND_OUTPUT_LINES {
+        let read = read_bounded_line(stdout, &mut response_line)
+            .map_err(|err| format!("Failed reading backend stdout: {err}"))?;
+
+        if read == 0 {
+            return Err("Backend process exited unexpectedly".to_string());
+        }
+
+        let response_text = std::str::from_utf8(&response_line)
+            .map_err(|err| format!("Backend output is not valid UTF-8: {err}"))?;
+        let trimmed = response_text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(_)) => return Ok(trimmed.to_string()),
+            Ok(_) => continue,
+            Err(_) => {
+                let preview: String = trimmed.chars().take(200).collect();
+                eprintln!("Ignoring non-JSON backend output: {preview}");
+            }
+        }
+    }
+
+    Err("Backend produced too many invalid output lines".to_string())
+}
+
+fn backend_worker(
+    mut stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    request_receiver: Receiver<BackendRequest>,
+) {
+    let mut stdout = BufReader::new(stdout);
+    while let Ok(request) = request_receiver.recv() {
+        let response = exchange_backend_command(&mut stdin, &mut stdout, &request.payload);
+        let should_stop = response.is_err();
+        if request.response_sender.send(response).is_err() || should_stop {
+            break;
+        }
+    }
+}
+
+fn wait_for_backend_response(
+    receiver: &Receiver<Result<String, String>>,
+    timeout: Duration,
+) -> Result<String, String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(response) => response,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "Backend response timed out after {} seconds",
+            timeout.as_secs()
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("Backend I/O worker stopped unexpectedly".to_string())
+        }
+    }
+}
+
+fn backend_command_timeout(command: &str) -> Duration {
+    match command {
+        "poll_messages" | "ping" | "get_peer_count" => BACKEND_POLL_RESPONSE_TIMEOUT,
+        "start_tor" | "create_room" | "join_room" => BACKEND_TOR_RESPONSE_TIMEOUT,
+        _ => BACKEND_DEFAULT_RESPONSE_TIMEOUT,
+    }
+}
+
 impl BackendSession {
     fn start(app: &tauri::AppHandle) -> Result<Self, String> {
         let mut cmd = resolve_backend_command(app)?;
@@ -81,10 +172,19 @@ impl BackendSession {
             .take()
             .ok_or_else(|| "Failed to open backend stdout".to_string())?;
 
+        let (request_sender, request_receiver) = mpsc::sync_channel(BACKEND_REQUEST_QUEUE_CAPACITY);
+        if let Err(err) = thread::Builder::new()
+            .name("mutinychat-backend-io".to_string())
+            .spawn(move || backend_worker(stdin, stdout, request_receiver))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to start backend I/O worker: {err}"));
+        }
+
         Ok(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            request_sender: Some(request_sender),
         })
     }
 
@@ -92,47 +192,40 @@ impl BackendSession {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    fn send_command(&mut self, payload: &serde_json::Value) -> Result<String, String> {
-        writeln!(self.stdin, "{payload}")
-            .map_err(|err| format!("Failed writing JSON command to backend stdin: {err}"))?;
-        self.stdin
-            .flush()
-            .map_err(|err| format!("Failed flushing backend stdin: {err}"))?;
+    fn send_command(
+        &mut self,
+        payload: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let sender = self
+            .request_sender
+            .as_ref()
+            .ok_or_else(|| "Backend I/O worker is unavailable".to_string())?;
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let request = BackendRequest {
+            payload: payload.to_string(),
+            response_sender,
+        };
+        sender.try_send(request).map_err(|err| match err {
+            TrySendError::Full(_) => "Backend I/O worker is already busy".to_string(),
+            TrySendError::Disconnected(_) => "Backend I/O worker has stopped".to_string(),
+        })?;
 
-        let mut response_line = Vec::new();
-        for _ in 0..MAX_BACKEND_OUTPUT_LINES {
-            let read = read_bounded_line(&mut self.stdout, &mut response_line)
-                .map_err(|err| format!("Failed reading backend stdout: {err}"))?;
-
-            if read == 0 {
-                return Err("Backend process exited unexpectedly".to_string());
-            }
-
-            let response_text = std::str::from_utf8(&response_line)
-                .map_err(|err| format!("Backend output is not valid UTF-8: {err}"))?;
-            let trimmed = response_text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            match serde_json::from_str::<serde_json::Value>(trimmed) {
-                Ok(serde_json::Value::Object(_)) => return Ok(trimmed.to_string()),
-                Ok(_) => continue,
-                Err(_) => {
-                    let preview: String = trimmed.chars().take(200).collect();
-                    eprintln!("Ignoring non-JSON backend output: {preview}");
-                }
-            }
-        }
-
-        Err("Backend produced too many invalid output lines".to_string())
+        wait_for_backend_response(&response_receiver, timeout)
     }
 }
 
 impl Drop for BackendSession {
     fn drop(&mut self) {
+        self.request_sender.take();
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + BACKEND_SHUTDOWN_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 }
 
@@ -315,9 +408,18 @@ fn run_backend_command(
     }
 
     let lock = backend_session_lock();
-    let mut guard = lock
-        .lock()
-        .map_err(|_| "Failed to lock backend session".to_string())?;
+    let mut guard = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            if command == "poll_messages" {
+                return Ok(json!({ "status": "busy" }).to_string());
+            }
+            return Err("Backend is busy processing another command; try again".to_string());
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            return Err("Failed to lock backend session".to_string());
+        }
+    };
 
     let needs_restart = match guard.as_mut() {
         Some(session) => !session.is_running(),
@@ -332,16 +434,14 @@ fn run_backend_command(
         .as_mut()
         .ok_or_else(|| "Backend session unavailable".to_string())?;
 
-    match session.send_command(&payload) {
+    let result = session.send_command(&payload, backend_command_timeout(command));
+    match result {
         Ok(response) => Ok(response),
-        Err(first_error) => {
-            *guard = Some(BackendSession::start(app)?);
-            let retry_session = guard
-                .as_mut()
-                .ok_or_else(|| "Backend session unavailable after restart".to_string())?;
-            retry_session.send_command(&payload).map_err(|retry_error| {
-                format!("Backend command failed: {first_error}; retry failed: {retry_error}")
-            })
+        Err(error) => {
+            *guard = None;
+            Err(format!(
+                "Backend command failed and the backend was stopped: {error}"
+            ))
         }
     }
 }
@@ -357,8 +457,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bounded_line, MAX_BACKEND_OUTPUT_LINE_BYTES};
+    use super::{
+        backend_command_timeout, exchange_backend_command, read_bounded_line,
+        wait_for_backend_response, BACKEND_DEFAULT_RESPONSE_TIMEOUT, BACKEND_POLL_RESPONSE_TIMEOUT,
+        BACKEND_TOR_RESPONSE_TIMEOUT, MAX_BACKEND_OUTPUT_LINE_BYTES,
+    };
     use std::io::{Cursor, ErrorKind};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn bounded_line_reader_accepts_normal_json() {
@@ -406,5 +512,51 @@ mod tests {
         let read = read_bounded_line(&mut reader, &mut output).expect("EOF line should pass");
 
         assert_eq!(b"{\"status\":\"ok\"}".len(), read);
+    }
+
+    #[test]
+    fn backend_exchange_writes_request_and_accepts_json_response() {
+        let mut stdin = Vec::new();
+        let mut stdout = Cursor::new(b"{\"status\":\"ok\"}\n".to_vec());
+
+        let response = exchange_backend_command(&mut stdin, &mut stdout, "{\"cmd\":\"ping\"}")
+            .expect("backend exchange should succeed");
+
+        assert_eq!(b"{\"cmd\":\"ping\"}\n", stdin.as_slice());
+        assert_eq!("{\"status\":\"ok\"}", response);
+    }
+
+    #[test]
+    fn backend_response_wait_has_a_real_deadline() {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+
+        let error = wait_for_backend_response(&receiver, timeout)
+            .expect_err("an unresponsive backend must time out");
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() >= timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backend_commands_use_bounded_class_specific_timeouts() {
+        assert_eq!(
+            BACKEND_POLL_RESPONSE_TIMEOUT,
+            backend_command_timeout("poll_messages")
+        );
+        assert_eq!(
+            BACKEND_TOR_RESPONSE_TIMEOUT,
+            backend_command_timeout("create_room")
+        );
+        assert_eq!(
+            BACKEND_TOR_RESPONSE_TIMEOUT,
+            backend_command_timeout("join_room")
+        );
+        assert_eq!(
+            BACKEND_DEFAULT_RESPONSE_TIMEOUT,
+            backend_command_timeout("send_message")
+        );
     }
 }
