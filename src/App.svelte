@@ -15,6 +15,11 @@
     utf8ByteLength
   } from "./lib/messageHistory.js";
   import { FRONTEND_CONTROL_EVENTS, parseFrontendEvent } from "./lib/frontendEvents.js";
+  import {
+    INVITATION_CLIPBOARD_TTL_MS,
+    clearInvitationFromClipboard,
+    writeInvitationToClipboard
+  } from "./lib/invitationClipboard.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
   import { mapBackendTorState, torBadgeDescription, torBadgeText } from "./lib/torStatus.js";
 
@@ -61,6 +66,11 @@
   let alertVisible = $state(false);
   let shutdownRequested = $state(false);
   let backendAvailable = $state(true);
+  /** @type {number | null} */
+  let invitationClipboardTimer = null;
+  let copiedInvitation = "";
+  /** @type {Promise<boolean>} */
+  let invitationClipboardCleanup = Promise.resolve(false);
   let connectionPresentation = $derived(
     deriveConnectionPresentation({
       backendAvailable,
@@ -114,6 +124,18 @@
   function clearMessageHistory() {
     messages = [];
     discardedMessageCount = 0;
+  }
+
+  async function clearCopiedInvitation() {
+    if (invitationClipboardTimer !== null && typeof window !== "undefined") {
+      window.clearTimeout(invitationClipboardTimer);
+      invitationClipboardTimer = null;
+    }
+    const invitation = copiedInvitation;
+    copiedInvitation = "";
+    if (!invitation || typeof navigator === "undefined") return invitationClipboardCleanup;
+    invitationClipboardCleanup = clearInvitationFromClipboard(navigator.clipboard, invitation);
+    return invitationClipboardCleanup;
   }
 
   /** @param {string} text @param {boolean} isMine @param {string} [sender] */
@@ -232,6 +254,7 @@
   }
 
   async function closeRoomFromFrontend() {
+    void clearCopiedInvitation();
     try {
       backendStatus = "Closing room...";
       await invoke("backend_ipc", {
@@ -266,6 +289,7 @@
   async function requestGracefulShutdown() {
     if (shutdownRequested) return;
     shutdownRequested = true;
+    void clearCopiedInvitation();
     try {
       await invoke("backend_ipc", {
         command: "close_room",
@@ -281,6 +305,7 @@
     const finalName = roomDraftName.trim() || roomName;
 
     try {
+      await clearCopiedInvitation();
       isCreatingRoom = true;
       backendStatus = "Creating room...";
       const response = await invoke("backend_ipc", {
@@ -476,8 +501,19 @@
     if (!shareLink) return;
 
     try {
-      await navigator.clipboard.writeText(shareLink);
-      copyNotice = "Link copied";
+      await clearCopiedInvitation();
+      const invitation = await writeInvitationToClipboard(navigator.clipboard, shareLink);
+      copiedInvitation = invitation;
+      invitationClipboardTimer = window.setTimeout(() => {
+        invitationClipboardTimer = null;
+        if (copiedInvitation !== invitation) return;
+        copiedInvitation = "";
+        invitationClipboardCleanup = clearInvitationFromClipboard(navigator.clipboard, invitation);
+        void invitationClipboardCleanup.then((cleared) => {
+          if (cleared) copyNotice = "Invitation removed from the clipboard";
+        });
+      }, INVITATION_CLIPBOARD_TTL_MS);
+      copyNotice = "Invitation copied; MutinyChat will try to clear it after 60 seconds";
     } catch (error) {
       copyNotice = `Copy failed: ${String(error)}`;
     }
@@ -577,7 +613,7 @@
             if (channelStatus !== "disconnected" || peerCount !== 0) continue;
             clearMessageHistory();
             currentView = "lobby";
-            showToast("Room closed – chat history erased");
+            showToast("Room closed – visible chat history cleared");
             continue;
           }
 
@@ -645,6 +681,7 @@
       window.removeEventListener("beforeunload", handleBeforeUnload);
       window.removeEventListener("pagehide", handlePageHide);
       void requestGracefulShutdown();
+      void clearCopiedInvitation();
       if (pollTimer !== null) {
         window.clearInterval(pollTimer);
       }
@@ -813,7 +850,7 @@
 
         <!-- Ephemeral messages note -->
         <p class="ephemeral-note small mb-2 p-2 text-center fst-italic">
-          Messages will vanish when both leave
+          Closing the room clears messages from the app; secure deletion from device memory is not guaranteed.
         </p>
 
         <!-- Sound effects control panel -->
@@ -890,10 +927,14 @@
             <h2 class="room-ready-title mb-3">Room Ready</h2>
             <p class="room-ready-name mb-3 text-center text-break">{roomName}</p>
 
-            <!-- Share link button with word wrap -->
-            <button class="share-link-big btn btn-outline-primary w-100 mb-3 text-break" type="button" onclick={copyShareLink}>
+            <!-- Display the capability without making the whole surface an accidental copy target. -->
+            <div class="share-link-big border rounded w-100 mb-2 p-2 text-break" aria-label="Room invitation">
               <code class="text-break">{shareLink}</code>
-            </button>
+            </div>
+
+            <p class="room-note alert alert-warning small mb-3">
+              This invitation grants room access. Other apps, clipboard managers, or synced devices may read copied content. Prefer the QR code when practical.
+            </p>
 
             <!-- QR Code canvas with border -->
             <div class="qr-wrap border p-2 mb-3 rounded">
@@ -914,7 +955,9 @@
 
             <!-- Action buttons -->
             <div class="room-ready-actions d-flex gap-2 flex-wrap justify-content-center w-100">
-              <button class="modal-btn btn btn-secondary" type="button" onclick={copyShareLink}>Copy Link</button>
+              <button class="modal-btn btn btn-secondary" type="button" onclick={copyShareLink}>
+                Copy invitation (60-second auto-clear attempt)
+              </button>
               <button
                 class="modal-btn btn btn-primary"
                 type="button"
@@ -1578,10 +1621,7 @@
     text-align: left;
     padding: 0.52rem 0.7rem !important;
     min-height: auto;
-  }
-
-  .share-link-big:hover {
-    background: linear-gradient(180deg, #f0f5ff 0%, #d6e3ff 100%) !important;
+    user-select: text;
   }
 
   .share-link-big code {

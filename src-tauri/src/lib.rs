@@ -18,6 +18,7 @@ const BACKEND_REQUEST_QUEUE_CAPACITY: usize = 1;
 const BACKEND_POLL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKEND_TOR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+const BACKEND_CLOSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -150,6 +151,44 @@ fn backend_command_timeout(command: &str) -> Duration {
     }
 }
 
+fn request_backend_close(
+    sender: &SyncSender<BackendRequest>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    sender
+        .try_send(BackendRequest {
+            payload: json!({ "cmd": "close_room" }).to_string(),
+            response_sender,
+        })
+        .map_err(|err| match err {
+            TrySendError::Full(_) => {
+                "Backend is busy; graceful shutdown command could not be queued".to_string()
+            }
+            TrySendError::Disconnected(_) => {
+                "Backend I/O worker stopped before graceful shutdown".to_string()
+            }
+        })?;
+    wait_for_backend_response(&response_receiver, timeout).map(|_| ())
+}
+
+fn finish_backend_command<T>(
+    session: &mut Option<T>,
+    result: Result<String, String>,
+) -> Result<String, String> {
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            // The backend may have completed a state-changing request before its response failed.
+            // Stop the uncertain session, but never replay that request automatically.
+            *session = None;
+            Err(format!(
+                "Backend command failed and the backend was stopped: {error}"
+            ))
+        }
+    }
+}
+
 impl BackendSession {
     fn start(app: &tauri::AppHandle) -> Result<Self, String> {
         let mut cmd = resolve_backend_command(app)?;
@@ -217,12 +256,23 @@ impl BackendSession {
 
 impl Drop for BackendSession {
     fn drop(&mut self) {
+        if let Some(sender) = self.request_sender.as_ref() {
+            let _ = request_backend_close(sender, BACKEND_CLOSE_COMMAND_TIMEOUT);
+        }
         self.request_sender.take();
+        let deadline = Instant::now() + BACKEND_SHUTDOWN_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+
         let _ = self.child.kill();
         let deadline = Instant::now() + BACKEND_SHUTDOWN_TIMEOUT;
         while Instant::now() < deadline {
             match self.child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
+                Ok(Some(_)) | Err(_) => return,
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
             }
         }
@@ -233,6 +283,15 @@ static BACKEND_SESSION: OnceLock<Mutex<Option<BackendSession>>> = OnceLock::new(
 
 fn backend_session_lock() -> &'static Mutex<Option<BackendSession>> {
     BACKEND_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+fn stop_backend_session() {
+    let mut guard = match backend_session_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => return,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    guard.take();
 }
 
 #[tauri::command]
@@ -435,31 +494,30 @@ fn run_backend_command(
         .ok_or_else(|| "Backend session unavailable".to_string())?;
 
     let result = session.send_command(&payload, backend_command_timeout(command));
-    match result {
-        Ok(response) => Ok(response),
-        Err(error) => {
-            *guard = None;
-            Err(format!(
-                "Backend command failed and the backend was stopped: {error}"
-            ))
-        }
-    }
+    finish_backend_command(&mut *guard, result)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![backend_ipc])
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building Tauri application");
+
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            stop_backend_session();
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_command_timeout, exchange_backend_command, read_bounded_line,
-        wait_for_backend_response, BACKEND_DEFAULT_RESPONSE_TIMEOUT, BACKEND_POLL_RESPONSE_TIMEOUT,
+        backend_command_timeout, exchange_backend_command, finish_backend_command,
+        read_bounded_line, request_backend_close, wait_for_backend_response,
+        BACKEND_DEFAULT_RESPONSE_TIMEOUT, BACKEND_POLL_RESPONSE_TIMEOUT,
         BACKEND_TOR_RESPONSE_TIMEOUT, MAX_BACKEND_OUTPUT_LINE_BYTES,
     };
     use std::io::{Cursor, ErrorKind};
@@ -558,5 +616,34 @@ mod tests {
             BACKEND_DEFAULT_RESPONSE_TIMEOUT,
             backend_command_timeout("send_message")
         );
+    }
+
+    #[test]
+    fn failed_backend_command_stops_session_without_replaying_request() {
+        let mut session = Some("original backend session");
+
+        let error = finish_backend_command(&mut session, Err("response was lost".to_string()))
+            .expect_err("an uncertain command result must be returned to the caller");
+
+        assert!(session.is_none());
+        assert!(error.contains("backend was stopped"));
+        assert!(error.contains("response was lost"));
+    }
+
+    #[test]
+    fn graceful_backend_close_uses_only_the_idempotent_close_command() {
+        let (request_sender, request_receiver) = mpsc::sync_channel::<super::BackendRequest>(1);
+        let worker = std::thread::spawn(move || {
+            let request = request_receiver.recv().expect("shutdown request");
+            assert_eq!(r#"{"cmd":"close_room"}"#, request.payload);
+            request
+                .response_sender
+                .send(Ok(r#"{"status":"closed"}"#.to_string()))
+                .expect("shutdown response");
+        });
+
+        request_backend_close(&request_sender, Duration::from_secs(1))
+            .expect("graceful shutdown should complete");
+        worker.join().expect("worker should finish");
     }
 }

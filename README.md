@@ -71,6 +71,7 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - Invitation-bound host keys plus a session safety code derived from both ephemeral keys and the onion address
 - Chat remains locked until both participants confirm that they compared the same safety code
 - Runtime Tor data stored in a temporary writable directory and removed during normal shutdown
+- Room messages are kept in process memory and removed from the visible chat when the room closes; this is not secure erasure of memory, swap, or crash data
 
 ## Repository layout
 
@@ -199,6 +200,8 @@ These steps are required before calling a release fully verified. They are not m
 - First-contact identity still requires the two people to compare the safety code through a separate trusted channel; the app cannot automatically know a person's real-world identity.
 - The cryptographic and networking design has not received an independent professional audit.
 - Unexpected termination may leave temporary Tor data until the operating system cleans its temporary directory.
+- Closing a room clears application-held references and visible history, but Python, Rust, WebView, operating-system swap, and crash-dump memory are not securely zeroized.
+- Copying an invitation is explicit and warns that the clipboard is shared operating-system state. MutinyChat tries to clear that exact value after 60 seconds or when the room closes, but clipboard history, synchronization, or another application may retain it.
 - The application remains a two-person prototype rather than a general-purpose group messenger.
 
 ## Security and privacy notes
