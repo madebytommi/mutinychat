@@ -14,6 +14,7 @@
   } from "./lib/messageHistory.js";
   import { FRONTEND_CONTROL_EVENTS, parseFrontendEvent } from "./lib/frontendEvents.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
+  import { mapBackendTorState, torBadgeDescription, torBadgeText } from "./lib/torStatus.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
 
@@ -48,7 +49,7 @@
   let isEncrypted = $state(false);
   let channelStatus = $state("disconnected");
   let channelError = $state("");
-  let isTorProtected = $state(false);
+  let torState = $state(mapBackendTorState({ tor_status: "stopped" }));
   let isPeerVerified = $state(false);
   let identityStatus = $state("unavailable");
   let verificationCode = $state("");
@@ -91,6 +92,11 @@
     verificationCode = security.verificationCode;
     verificationLocalConfirmed = security.verificationLocalConfirmed;
     verificationPeerConfirmed = security.verificationPeerConfirmed;
+  }
+
+  /** @param {Record<string, unknown> | null | undefined} payload */
+  function applyTorState(payload) {
+    torState = mapBackendTorState(payload);
   }
 
   function clearMessageHistory() {
@@ -182,17 +188,19 @@
   async function startTorFromFrontend() {
     try {
       backendStatus = "Starting Tor...";
+      torState = { status: "starting", routeActive: false, error: "" };
       const response = await invoke("backend_ipc", {
         command: "start_tor",
         message: null,
         roomName: null
       });
-      backendStatus = String(response);
-      isTorProtected = true;
+      const parsed = JSON.parse(String(response));
+      applyTorState(parsed);
+      backendStatus = parsed.tor_status === "ready" ? "Tor ready" : "Tor unavailable";
     } catch (error) {
-      backendStatus = `Backend error: ${String(error)}. Install Tor with: brew install tor`;
-      isTorProtected = false;
-      showAlert("Tor failed to start - try again.");
+      backendStatus = `Backend error: ${String(error)}`;
+      torState = { status: "failed", routeActive: false, error: String(error) };
+      showAlert("Tor failed to start. Try again.");
     }
   }
 
@@ -237,7 +245,7 @@
     showJoinModal = false;
     joinLinkDraft = "";
     applySecurityState({ channel_status: "disconnected" });
-    isTorProtected = false;
+    applyTorState({ tor_status: "stopped" });
     peerCount = 0;
     shutdownRequested = false;
     currentView = "lobby";
@@ -540,7 +548,7 @@
         });
         const parsed = JSON.parse(String(response));
         applySecurityState(parsed);
-        isTorProtected = Boolean(parsed.tor_active);
+        applyTorState(parsed);
         peerCount = Number(parsed.peer_count || 0);
         if (channelStatus === "failed") {
           connectionStatus = "Secure channel failed";
@@ -612,6 +620,11 @@
           channel_status: "failed",
           channel_error: "Backend connection unavailable"
         });
+        torState = {
+          status: "failed",
+          routeActive: false,
+          error: "Backend connection unavailable"
+        };
         peerCount = 0;
         connectionStatus = "Backend unavailable";
       } finally {
@@ -722,9 +735,16 @@
         <span class:encrypted={isEncrypted} class="encryption-badge d-inline-block flex-shrink-0" aria-live="polite">
           {channelBadgeText(channelStatus)}
         </span>
-        <!-- Tor protection badge -->
-        <span class:active={isTorProtected} class="tor-badge d-inline-block flex-shrink-0" aria-live="polite">
-          {isTorProtected ? "🛡 Tor" : "🛡 Offline"}
+        <!-- Current Tor runtime and room-routing status -->
+        <span
+          class:active={torState.routeActive}
+          class:ready={torState.status === "ready" && !torState.routeActive}
+          class:failed={torState.status === "failed"}
+          class="tor-badge d-inline-block flex-shrink-0"
+          aria-live="polite"
+          title={torBadgeDescription(torState)}
+        >
+          🛡 {torBadgeText(torState)}
         </span>
         <!-- Room name display -->
         <span class="room-name d-none d-sm-inline-block text-truncate flex-shrink-0">{roomName}</span>
@@ -1213,6 +1233,18 @@
     border-color: rgba(194, 236, 255, 0.75);
     background: rgba(17, 87, 140, 0.34);
     color: #dcf3ff;
+  }
+
+  .tor-badge.ready {
+    border-color: rgba(255, 227, 158, 0.8);
+    background: rgba(119, 83, 19, 0.4);
+    color: #fff0c9;
+  }
+
+  .tor-badge.failed {
+    border-color: rgba(255, 188, 188, 0.75);
+    background: rgba(122, 29, 29, 0.38);
+    color: #ffd7d7;
   }
 
   /* Onion badge */

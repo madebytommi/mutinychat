@@ -79,6 +79,7 @@ verification_event = threading.Event()
 
 tor_controller: Optional[Controller] = None
 tor_process: Any = None
+_tor_generation = 0
 active_service_id: Optional[str] = None
 active_local_port: Optional[int] = None
 active_socks_port: Optional[int] = None
@@ -194,11 +195,57 @@ def _stop_process(process: Any) -> None:
             pass
 
 
-def start_tor() -> Controller:
-    global tor_controller, tor_process, active_socks_port, _tor_data_dir
+def _tor_runtime_status_locked() -> tuple[str, Optional[str]]:
+    controller = tor_controller
+    process = tor_process
+    if controller is None and process is None:
+        return "stopped", None
+    if controller is None or process is None:
+        return "failed", "Tor process state is incomplete"
+    try:
+        if process.poll() is not None:
+            return "failed", "Tor process is no longer running"
+    except Exception:
+        return "failed", "Tor process status is unavailable"
+    try:
+        if not controller.is_alive():
+            return "failed", "Tor control connection is no longer alive"
+    except Exception:
+        return "failed", "Tor control connection status is unavailable"
+    return "ready", None
+
+
+def _tor_runtime_status() -> tuple[str, Optional[str]]:
     with state_lock:
-        if tor_controller is not None:
+        return _tor_runtime_status_locked()
+
+
+def start_tor() -> Controller:
+    global tor_controller, tor_process, active_service_id, active_local_port
+    global active_socks_port, _tor_data_dir, _tor_generation
+    with state_lock:
+        status, _ = _tor_runtime_status_locked()
+        if status == "ready" and tor_controller is not None:
             return tor_controller
+        stale_controller, stale_process, stale_data_dir = (
+            tor_controller,
+            tor_process,
+            _tor_data_dir,
+        )
+        tor_controller = None
+        tor_process = None
+        active_service_id = None
+        active_local_port = None
+        active_socks_port = None
+        _tor_data_dir = None
+        if stale_controller is not None:
+            try:
+                stale_controller.close()
+            except Exception:
+                pass
+        _stop_process(stale_process)
+        if stale_data_dir:
+            shutil.rmtree(stale_data_dir, ignore_errors=True)
         control_port = _pick_random_port()
         active_socks_port = _pick_random_port()
         _tor_data_dir = tempfile.mkdtemp(prefix="mutinychat-tor-")
@@ -211,10 +258,12 @@ def start_tor() -> Controller:
             )
             tor_controller = Controller.from_port(address="127.0.0.1", port=control_port)
             tor_controller.authenticate()
+            _tor_generation += 1
             return tor_controller
         except Exception as exc:
             _stop_process(tor_process)
             tor_process = None
+            tor_controller = None
             active_socks_port = None
             if _tor_data_dir:
                 shutil.rmtree(_tor_data_dir, ignore_errors=True)
@@ -1124,6 +1173,7 @@ def join_room(invitation: str, port: int) -> dict[str, Any]:
                 "onion_address": onion_host,
                 "port": port,
                 "expected_host_public_key": authenticated_invite.host_public_key,
+                "tor_generation": _tor_generation,
             }
     try:
         _perform_handshake(
@@ -1262,6 +1312,7 @@ def build_room_response(room_name: str) -> dict[str, Any]:
     _active_room = {
         "mode": "host", "friendly_name": room_name, "onion_address": room["onion_address"],
         "service_id": active_service_id, "local_port": active_local_port,
+        "tor_generation": _tor_generation,
     }
     _connection_mode = "host"
     _peer_count = 1
@@ -1289,6 +1340,13 @@ def poll_messages() -> dict[str, Any]:
             event_bytes += serialized_bytes
         events_pending = len(_inbox)
     with state_lock:
+        tor_status, tor_error = _tor_runtime_status_locked()
+        tor_route_active = bool(
+            tor_status == "ready"
+            and _active_room is not None
+            and _active_room.get("tor_generation") == _tor_generation
+            and _connection_mode in {"host", "guest"}
+        )
         channel_status = _channel_status
         encrypted = (
             channel_status == "confirmed"
@@ -1320,7 +1378,9 @@ def poll_messages() -> dict[str, Any]:
         "verification_local_confirmed": local_confirmed if encrypted else False,
         "verification_peer_confirmed": peer_confirmed if encrypted else False,
         "protocol_version": PROTOCOL_VERSION,
-        "tor_active": tor_controller is not None,
+        "tor_status": tor_status,
+        "tor_error": tor_error,
+        "tor_route_active": tor_route_active,
         "peer_count": _peer_count,
     }
 
@@ -1339,7 +1399,8 @@ def handle_json_command(payload: dict[str, Any]) -> dict[str, Any]:
             return {"friendly_name": generate_random_room_name()}
         if command == "start_tor":
             start_tor()
-            return {"status": "ready"}
+            tor_status, tor_error = _tor_runtime_status()
+            return {"status": tor_status, "tor_status": tor_status, "tor_error": tor_error}
         if command == "start_listening":
             return start_listening()
         if command == "join_room":
