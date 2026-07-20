@@ -21,6 +21,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm run test:frontend
       - run: npm run build
       - name: Reject external frontend runtime resources
         run: npm run check:frontend-network

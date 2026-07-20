@@ -32,11 +32,10 @@ def _wait_for_verification() -> bool:
     return backend.verification_event.wait(WAIT_SECONDS)
 
 
-def _prepare_state(role: str, conn: socket.socket, private_key: PrivateKey) -> None:
+def _prepare_state(role: str, conn: socket.socket, private_key: PrivateKey) -> int:
     backend.close_room()
     backend.stop_event.clear()
     backend._private_key = private_key
-    backend.active_peer_socket = conn
     backend._connection_mode = role
     backend._peer_count = 2
     backend._active_room = {
@@ -44,10 +43,18 @@ def _prepare_state(role: str, conn: socket.socket, private_key: PrivateKey) -> N
         "onion_address": TEST_ONION,
         "port": backend.DEFAULT_ONION_PORT,
     }
+    generation = backend._claim_active_peer_socket(conn)
+    if generation is None:
+        raise RuntimeError("Test peer connection could not claim the session")
+    return generation
 
 
-def _start_reader(conn: socket.socket) -> threading.Thread:
-    reader = threading.Thread(target=backend._read_socket_messages, args=(conn,), daemon=True)
+def _start_reader(conn: socket.socket, generation: int) -> threading.Thread:
+    reader = threading.Thread(
+        target=backend._read_socket_messages,
+        args=(conn, generation),
+        daemon=True,
+    )
     reader.start()
     return reader
 
@@ -56,7 +63,9 @@ def _result(role: str, received: str) -> dict[str, Any]:
     state = backend.poll_messages()
     return {
         "role": role,
+        "channel_status": state["channel_status"],
         "encrypted": state["encrypted"],
+        "identity_status": state["identity_status"],
         "verified": state["verified"],
         "verification_code": state["verification_code"],
         "received": received,
@@ -84,9 +93,9 @@ def run_host(port: int) -> int:
     conn, _ = listener.accept()
     listener.close()
     try:
-        _prepare_state("host", conn, private_key)
-        backend._perform_handshake(conn, "host")
-        _start_reader(conn)
+        generation = _prepare_state("host", conn, private_key)
+        backend._perform_handshake(conn, "host", generation)
+        _start_reader(conn, generation)
         confirmation = backend.confirm_verification()
         if confirmation["status"] == "error" or not _wait_for_verification():
             raise RuntimeError("Host verification did not complete")
@@ -106,9 +115,9 @@ def run_guest(port: int, expected_host_key_b64: str) -> int:
     expected_host_key = base64.b64decode(expected_host_key_b64, validate=True)
     conn = socket.create_connection(("127.0.0.1", port), timeout=WAIT_SECONDS)
     try:
-        _prepare_state("guest", conn, private_key)
-        backend._perform_handshake(conn, "guest", expected_host_key)
-        _start_reader(conn)
+        generation = _prepare_state("guest", conn, private_key)
+        backend._perform_handshake(conn, "guest", generation, expected_host_key)
+        _start_reader(conn, generation)
         confirmation = backend.confirm_verification()
         if confirmation["status"] == "error" or not _wait_for_verification():
             raise RuntimeError("Guest verification did not complete")

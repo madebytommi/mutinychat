@@ -10,14 +10,17 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 INVITE_SCHEME = "mutinychat"
 INVITE_HOST = "join"
 PUBLIC_KEY_BYTES = 32
 HANDSHAKE_NONCE_BYTES = 32
+CHANNEL_CHALLENGE_BYTES = 32
+TRANSCRIPT_HASH_BYTES = 32
 SAFETY_CODE_DIGITS = 20
 MAX_INVITE_CHARS = 512
 ONION_V3_RE = re.compile(r"^[a-z2-7]{56}\.onion$", re.IGNORECASE)
+TRANSCRIPT_DOMAIN = b"MutinyChat channel transcript v3"
 
 
 @dataclass(frozen=True)
@@ -100,13 +103,76 @@ def parse_invite(value: str) -> AuthenticatedInvite:
     except ValueError as exc:
         raise ValueError("Invitation protocol version is invalid") from exc
     if version != PROTOCOL_VERSION:
-        raise ValueError(f"Invitation protocol version {version} is unsupported")
+        if version == 2:
+            raise ValueError(
+                "Invitation protocol version 2 is incompatible; both participants must update "
+                "to protocol version 3"
+            )
+        raise ValueError(f"Invitation protocol version {version} is unsupported; update required")
 
     return AuthenticatedInvite(
         onion_address=_validate_onion(query["onion"][0]),
         host_public_key=decode_public_key(query["host_key"][0]),
         protocol_version=version,
     )
+
+
+def _encode_fixed_bytes(value: bytes, expected_length: int, label: str) -> str:
+    if len(value) != expected_length:
+        raise ValueError(f"{label} has an invalid length")
+    return base64.b64encode(value).decode("ascii")
+
+
+def _decode_fixed_bytes(value: str, expected_length: int, label: str) -> bytes:
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"{label} is malformed") from exc
+    if len(raw) != expected_length:
+        raise ValueError(f"{label} has an invalid length")
+    if not hmac.compare_digest(_encode_fixed_bytes(raw, expected_length, label), value):
+        raise ValueError(f"{label} is not canonically encoded")
+    return raw
+
+
+def _validate_role(role: str) -> str:
+    if role not in {"host", "guest"}:
+        raise ValueError("Participant role must be host or guest")
+    return role
+
+
+def derive_handshake_transcript_hash(
+    host_public_key: bytes,
+    guest_public_key: bytes,
+    onion_address: str,
+    host_nonce: bytes,
+    guest_nonce: bytes,
+) -> bytes:
+    if len(host_public_key) != PUBLIC_KEY_BYTES or len(guest_public_key) != PUBLIC_KEY_BYTES:
+        raise ValueError("Handshake transcript keys must each be 32 bytes")
+    if len(host_nonce) != HANDSHAKE_NONCE_BYTES or len(guest_nonce) != HANDSHAKE_NONCE_BYTES:
+        raise ValueError("Handshake transcript nonces must each be 32 bytes")
+    onion = _validate_onion(onion_address).encode("ascii")
+    transcript = b"\x00".join(
+        (
+            TRANSCRIPT_DOMAIN,
+            str(PROTOCOL_VERSION).encode("ascii"),
+            onion,
+            b"host-role",
+            b"host",
+            b"host-key",
+            bytes(host_public_key),
+            b"guest-role",
+            b"guest",
+            b"guest-key",
+            bytes(guest_public_key),
+            b"host-nonce",
+            bytes(host_nonce),
+            b"guest-nonce",
+            bytes(guest_nonce),
+        )
+    )
+    return hashlib.sha256(transcript).digest()
 
 
 def derive_safety_code(
@@ -116,52 +182,145 @@ def derive_safety_code(
     host_nonce: bytes,
     guest_nonce: bytes,
 ) -> str:
-    if len(host_public_key) != PUBLIC_KEY_BYTES or len(guest_public_key) != PUBLIC_KEY_BYTES:
-        raise ValueError("Safety-code keys must each be 32 bytes")
-    if len(host_nonce) != HANDSHAKE_NONCE_BYTES or len(guest_nonce) != HANDSHAKE_NONCE_BYTES:
-        raise ValueError("Safety-code handshake nonces must each be 32 bytes")
-    onion = _validate_onion(onion_address).encode("ascii")
-    transcript = b"\x00".join(
-        (
-            b"MutinyChat participant safety code",
-            str(PROTOCOL_VERSION).encode("ascii"),
-            onion,
-            b"host-key",
-            bytes(host_public_key),
-            b"guest-key",
-            bytes(guest_public_key),
-            b"host-nonce",
-            bytes(host_nonce),
-            b"guest-nonce",
-            bytes(guest_nonce),
-        )
+    digest = derive_handshake_transcript_hash(
+        host_public_key,
+        guest_public_key,
+        onion_address,
+        host_nonce,
+        guest_nonce,
     )
-    digest = hashlib.sha256(transcript).digest()
     number = int.from_bytes(digest[:9], "big") % (10**SAFETY_CODE_DIGITS)
     digits = f"{number:0{SAFETY_CODE_DIGITS}d}"
     return " ".join(digits[index : index + 5] for index in range(0, SAFETY_CODE_DIGITS, 5))
 
 
-def build_confirmation_payload(safety_code: str) -> str:
+def build_channel_challenge_payload(
+    sender_role: str,
+    transcript_hash: bytes,
+    challenge: bytes,
+) -> str:
+    return json.dumps(
+        {
+            "type": "channel_challenge",
+            "v": PROTOCOL_VERSION,
+            "role": _validate_role(sender_role),
+            "transcript": _encode_fixed_bytes(
+                transcript_hash, TRANSCRIPT_HASH_BYTES, "Handshake transcript hash"
+            ),
+            "challenge": _encode_fixed_bytes(
+                challenge, CHANNEL_CHALLENGE_BYTES, "Channel challenge"
+            ),
+        },
+        separators=(",", ":"),
+    )
+
+
+def parse_channel_challenge_payload(
+    payload: str,
+    expected_role: str,
+    expected_transcript_hash: bytes,
+) -> bytes:
+    value = _parse_protocol_payload(payload, "channel_challenge")
+    if set(value) != {"type", "v", "role", "transcript", "challenge"}:
+        raise ValueError("Peer channel challenge has unexpected fields")
+    _validate_expected_role_and_transcript(value, expected_role, expected_transcript_hash)
+    return _decode_fixed_bytes(
+        str(value.get("challenge", "")), CHANNEL_CHALLENGE_BYTES, "Peer channel challenge"
+    )
+
+
+def build_channel_response_payload(
+    sender_role: str,
+    transcript_hash: bytes,
+    response: bytes,
+) -> str:
+    return json.dumps(
+        {
+            "type": "channel_response",
+            "v": PROTOCOL_VERSION,
+            "role": _validate_role(sender_role),
+            "transcript": _encode_fixed_bytes(
+                transcript_hash, TRANSCRIPT_HASH_BYTES, "Handshake transcript hash"
+            ),
+            "response": _encode_fixed_bytes(
+                response, CHANNEL_CHALLENGE_BYTES, "Channel challenge response"
+            ),
+        },
+        separators=(",", ":"),
+    )
+
+
+def parse_channel_response_payload(
+    payload: str,
+    expected_role: str,
+    expected_transcript_hash: bytes,
+) -> bytes:
+    value = _parse_protocol_payload(payload, "channel_response")
+    if set(value) != {"type", "v", "role", "transcript", "response"}:
+        raise ValueError("Peer channel response has unexpected fields")
+    _validate_expected_role_and_transcript(value, expected_role, expected_transcript_hash)
+    return _decode_fixed_bytes(
+        str(value.get("response", "")), CHANNEL_CHALLENGE_BYTES, "Peer channel response"
+    )
+
+
+def _parse_protocol_payload(payload: str, expected_type: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Peer {expected_type.replace('_', ' ')} is malformed") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Peer {expected_type.replace('_', ' ')} must be an object")
+    if value.get("type") != expected_type or value.get("v") != PROTOCOL_VERSION:
+        raise ValueError(f"Peer {expected_type.replace('_', ' ')} has an unsupported format")
+    return value
+
+
+def _validate_expected_role_and_transcript(
+    value: dict[str, object],
+    expected_role: str,
+    expected_transcript_hash: bytes,
+) -> None:
+    if value.get("role") != _validate_role(expected_role):
+        raise ValueError("Peer confirmation role is invalid")
+    received_hash = _decode_fixed_bytes(
+        str(value.get("transcript", "")),
+        TRANSCRIPT_HASH_BYTES,
+        "Peer handshake transcript hash",
+    )
+    if not hmac.compare_digest(received_hash, expected_transcript_hash):
+        raise ValueError("Peer confirmation does not match this handshake transcript")
+
+
+def build_confirmation_payload(
+    safety_code: str,
+    sender_role: str,
+    transcript_hash: bytes,
+) -> str:
     return json.dumps(
         {
             "type": "participant_verification",
             "v": PROTOCOL_VERSION,
+            "role": _validate_role(sender_role),
+            "transcript": _encode_fixed_bytes(
+                transcript_hash, TRANSCRIPT_HASH_BYTES, "Handshake transcript hash"
+            ),
             "code": safety_code,
         },
         separators=(",", ":"),
     )
 
 
-def validate_confirmation_payload(payload: str, expected_safety_code: str) -> None:
-    try:
-        value = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Peer verification confirmation is malformed") from exc
-    if not isinstance(value, dict):
-        raise ValueError("Peer verification confirmation must be an object")
-    if value.get("type") != "participant_verification" or value.get("v") != PROTOCOL_VERSION:
-        raise ValueError("Peer verification confirmation has an unsupported format")
+def validate_confirmation_payload(
+    payload: str,
+    expected_safety_code: str,
+    expected_role: str,
+    expected_transcript_hash: bytes,
+) -> None:
+    value = _parse_protocol_payload(payload, "participant_verification")
+    if set(value) != {"type", "v", "role", "transcript", "code"}:
+        raise ValueError("Peer verification confirmation has unexpected fields")
+    _validate_expected_role_and_transcript(value, expected_role, expected_transcript_hash)
     received = str(value.get("code", ""))
     if not hmac.compare_digest(received, expected_safety_code):
         raise ValueError("Peer verification confirmation does not match this session")

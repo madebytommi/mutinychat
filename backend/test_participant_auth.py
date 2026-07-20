@@ -1,14 +1,21 @@
+import json
 import unittest
 
 from nacl.public import PrivateKey
 
 from participant_auth import (
+    CHANNEL_CHALLENGE_BYTES,
     HANDSHAKE_NONCE_BYTES,
     MAX_INVITE_CHARS,
     PROTOCOL_VERSION,
+    build_channel_challenge_payload,
+    build_channel_response_payload,
     build_confirmation_payload,
     build_invite,
+    derive_handshake_transcript_hash,
     derive_safety_code,
+    parse_channel_challenge_payload,
+    parse_channel_response_payload,
     parse_invite,
     validate_confirmation_payload,
 )
@@ -56,6 +63,11 @@ class ParticipantAuthenticationTestCase(unittest.TestCase):
     def test_invite_rejects_oversized_input(self):
         with self.assertRaisesRegex(ValueError, "too long"):
             parse_invite("x" * (MAX_INVITE_CHARS + 1))
+
+    def test_protocol_v2_invite_is_rejected_without_downgrade(self):
+        invite = build_invite(self.onion, bytes(self.host.public_key)).replace("v=3", "v=2")
+        with self.assertRaisesRegex(ValueError, "both participants must update"):
+            parse_invite(invite)
 
     def test_safety_code_is_bound_to_roles_keys_onion_and_nonces(self):
         code = self.safety_code()
@@ -114,10 +126,64 @@ class ParticipantAuthenticationTestCase(unittest.TestCase):
 
     def test_confirmation_payload_must_match_session_code(self):
         code = self.safety_code()
-        payload = build_confirmation_payload(code)
-        validate_confirmation_payload(payload, code)
+        transcript = derive_handshake_transcript_hash(
+            bytes(self.host.public_key),
+            bytes(self.guest.public_key),
+            self.onion,
+            self.host_nonce,
+            self.guest_nonce,
+        )
+        payload = build_confirmation_payload(code, "host", transcript)
+        validate_confirmation_payload(payload, code, "host", transcript)
         with self.assertRaisesRegex(ValueError, "does not match"):
-            validate_confirmation_payload(payload, "00000 00000 00000 00000")
+            validate_confirmation_payload(
+                payload,
+                "00000 00000 00000 00000",
+                "host",
+                transcript,
+            )
+
+    def test_channel_payloads_are_role_and_transcript_bound(self):
+        transcript = derive_handshake_transcript_hash(
+            bytes(self.host.public_key),
+            bytes(self.guest.public_key),
+            self.onion,
+            self.host_nonce,
+            self.guest_nonce,
+        )
+        challenge = b"c" * CHANNEL_CHALLENGE_BYTES
+        challenge_payload = build_channel_challenge_payload("host", transcript, challenge)
+        response_payload = build_channel_response_payload("guest", transcript, challenge)
+        self.assertEqual(
+            challenge,
+            parse_channel_challenge_payload(challenge_payload, "host", transcript),
+        )
+        self.assertEqual(
+            challenge,
+            parse_channel_response_payload(response_payload, "guest", transcript),
+        )
+        with self.assertRaisesRegex(ValueError, "role"):
+            parse_channel_challenge_payload(challenge_payload, "guest", transcript)
+        with self.assertRaisesRegex(ValueError, "transcript"):
+            parse_channel_response_payload(response_payload, "guest", b"x" * 32)
+
+    def test_channel_payload_rejects_malformed_challenge_encoding(self):
+        transcript = derive_handshake_transcript_hash(
+            bytes(self.host.public_key),
+            bytes(self.guest.public_key),
+            self.onion,
+            self.host_nonce,
+            self.guest_nonce,
+        )
+        value = json.loads(
+            build_channel_challenge_payload(
+                "host", transcript, b"c" * CHANNEL_CHALLENGE_BYTES
+            )
+        )
+        value["challenge"] = "!!!!"
+        payload = json.dumps(value, separators=(",", ":"))
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            parse_channel_challenge_payload(payload, "host", transcript)
 
 
 if __name__ == "__main__":

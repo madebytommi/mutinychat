@@ -70,8 +70,12 @@ class ParticipantProcessIntegrationTestCase(unittest.TestCase):
         host_result = _last_json_line(host_stdout)
         guest_result = _last_json_line(guest_stdout)
 
+        self.assertEqual("confirmed", host_result["channel_status"])
+        self.assertEqual("confirmed", guest_result["channel_status"])
         self.assertTrue(host_result["encrypted"])
         self.assertTrue(guest_result["encrypted"])
+        self.assertEqual("verified", host_result["identity_status"])
+        self.assertEqual("verified", guest_result["identity_status"])
         self.assertTrue(host_result["verified"])
         self.assertTrue(guest_result["verified"])
         self.assertEqual(host_result["verification_code"], guest_result["verification_code"])
