@@ -95,6 +95,12 @@ class BackendTestCase(unittest.TestCase):
             backend.send_message("hello"),
         )
 
+    def test_send_message_rejects_oversized_utf8_payload_before_peer_lookup(self):
+        result = backend.send_message("é" * (backend.MAX_CHAT_MESSAGE_BYTES // 2 + 1))
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("16 KiB", result["error"])
+
     def test_ephemeral_box_round_trip_between_peers(self):
         alice = PrivateKey.generate()
         bob = PrivateKey.generate()
@@ -349,12 +355,161 @@ class BackendTestCase(unittest.TestCase):
         self.assertFalse(backend.verification_event.is_set())
 
     def test_poll_messages_drains_queue(self):
-        backend._queue_frontend_message("one")
-        backend._queue_frontend_message("two")
+        self.assertTrue(backend._queue_frontend_message("one"))
+        self.assertTrue(backend._queue_frontend_message("two"))
         first = backend.poll_messages()
         second = backend.poll_messages()
         self.assertEqual(["one", "two"], first["messages"])
+        self.assertEqual(0, first["messages_pending"])
         self.assertEqual([], second["messages"])
+
+    def test_poll_messages_returns_bounded_fifo_batches(self):
+        total = backend.MAX_POLL_MESSAGES + 5
+        for index in range(total):
+            self.assertTrue(backend._queue_frontend_message(f"message-{index}"))
+
+        first = backend.poll_messages()
+        second = backend.poll_messages()
+
+        self.assertEqual(
+            [f"message-{index}" for index in range(backend.MAX_POLL_MESSAGES)],
+            first["messages"],
+        )
+        self.assertEqual(5, first["messages_pending"])
+        self.assertEqual(
+            [f"message-{index}" for index in range(backend.MAX_POLL_MESSAGES, total)],
+            second["messages"],
+        )
+        self.assertEqual(0, second["messages_pending"])
+
+    def test_frontend_queue_enforces_message_count_limit(self):
+        for index in range(backend.MAX_FRONTEND_QUEUE_MESSAGES):
+            self.assertTrue(backend._queue_frontend_message(f"message-{index}"))
+
+        self.assertFalse(backend._queue_frontend_message("overflow"))
+        self.assertEqual(backend.MAX_FRONTEND_QUEUE_MESSAGES, len(backend._inbox))
+
+    def test_frontend_queue_enforces_serialized_byte_limit(self):
+        message = "\\" * 16_000
+        serialized_size = backend._serialized_message_size(message)
+        accepted = 0
+        while backend._queue_frontend_message(message):
+            accepted += 1
+
+        self.assertGreater(accepted, 0)
+        self.assertLessEqual(backend._inbox_bytes, backend.MAX_FRONTEND_QUEUE_BYTES)
+        self.assertGreater(
+            backend._inbox_bytes + serialized_size,
+            backend.MAX_FRONTEND_QUEUE_BYTES,
+        )
+
+    def test_poll_messages_enforces_serialized_byte_limit(self):
+        message = "\\" * backend.MAX_CHAT_MESSAGE_BYTES
+        for _ in range(4):
+            self.assertTrue(backend._queue_frontend_message(message))
+
+        response = backend.poll_messages()
+        serialized_messages = sum(
+            backend._serialized_message_size(item) for item in response["messages"]
+        )
+
+        self.assertLessEqual(serialized_messages, backend.MAX_POLL_MESSAGE_BYTES)
+        self.assertGreater(response["messages_pending"], 0)
+
+    def test_oversized_peer_ciphertext_is_rejected_before_decryption(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            _promote_test_channel(bytes(bob.public_key))
+            backend.verification_event.set()
+            frame = json.dumps(
+                {
+                    "type": "message",
+                    "ciphertext": "A" * (backend.MAX_ENCRYPTED_MESSAGE_CHARS + 1),
+                }
+            ).encode("utf-8")
+
+            with self.assertRaisesRegex(ValueError, "too large"):
+                backend._process_peer_frame(left, generation, frame)
+        finally:
+            left.close()
+            right.close()
+
+    @mock.patch.object(backend, "_process_peer_frame", return_value=True)
+    def test_socket_reader_rejects_excessive_frame_rate(self, process_peer_frame):
+        left, right = socket.socketpair()
+        try:
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            right.sendall(b"{}\n" * (backend.MAX_INBOUND_FRAMES_PER_SECOND + 1))
+
+            backend._read_socket_messages(left, generation)
+
+            self.assertEqual(backend.MAX_INBOUND_FRAMES_PER_SECOND, process_peer_frame.call_count)
+            state = backend.poll_messages()
+            self.assertEqual("failed", state["channel_status"])
+            self.assertIn("rate limit", state["channel_error"])
+        finally:
+            left.close()
+            right.close()
+
+    @mock.patch.object(backend, "_process_peer_frame", return_value=True)
+    def test_socket_reader_rejects_oversized_application_frame(self, process_peer_frame):
+        left, right = socket.socketpair()
+        try:
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            right.sendall(b"x" * (backend.MAX_APPLICATION_FRAME_BYTES + 1) + b"\n")
+
+            backend._read_socket_messages(left, generation)
+
+            process_peer_frame.assert_not_called()
+            state = backend.poll_messages()
+            self.assertEqual("failed", state["channel_status"])
+            self.assertIn("too large", state["channel_error"])
+        finally:
+            left.close()
+            right.close()
+
+    def test_peer_queue_overflow_clears_pending_messages_and_fails(self):
+        alice = PrivateKey.generate()
+        bob = PrivateKey.generate()
+        left, right = socket.socketpair()
+        try:
+            backend._private_key = alice
+            backend._active_room = {"onion_address": "a" * 56 + ".onion"}
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            _promote_test_channel(bytes(bob.public_key))
+            backend.verification_event.set()
+            for index in range(backend.MAX_FRONTEND_QUEUE_MESSAGES):
+                self.assertTrue(backend._queue_frontend_message(f"queued-{index}"))
+            ciphertext = base64.b64encode(
+                bytes(Box(bob, alice.public_key).encrypt(b"overflow"))
+            ).decode("ascii")
+            frame = json.dumps({"type": "message", "ciphertext": ciphertext}).encode(
+                "utf-8"
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "pending message capacity"):
+                backend._process_peer_frame(left, generation, frame)
+
+            self.assertEqual(0, len(backend._inbox))
+            self.assertEqual(0, backend._inbox_bytes)
+        finally:
+            left.close()
+            right.close()
+
+    def test_friendly_error_truncates_peer_controlled_text(self):
+        result = backend._friendly_error(RuntimeError("x" * 10_000))
+
+        self.assertEqual(backend.MAX_ERROR_MESSAGE_CHARS, len(result))
+        self.assertTrue(result.endswith("…"))
 
     @mock.patch.object(backend, "create_hidden_service")
     @mock.patch.object(backend, "close_room")

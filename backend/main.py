@@ -5,6 +5,7 @@ import argparse
 import atexit
 import base64
 import binascii
+from collections import deque
 import json
 import hmac
 import os
@@ -46,6 +47,17 @@ DEFAULT_ONION_PORT = 8080
 CONNECT_TIMEOUT = 20
 HANDSHAKE_TIMEOUT = 15
 MAX_FRAME_BYTES = 1024 * 1024
+MAX_APPLICATION_FRAME_BYTES = 64 * 1024
+MAX_CHAT_MESSAGE_BYTES = 16 * 1024
+MAX_ENCRYPTED_MESSAGE_CHARS = ((MAX_CHAT_MESSAGE_BYTES + 64 + 2) // 3) * 4
+MAX_INBOUND_FRAMES_PER_SECOND = 64
+MAX_INBOUND_FRAME_BYTES_PER_SECOND = 512 * 1024
+MAX_FRONTEND_QUEUE_MESSAGES = 128
+MAX_FRONTEND_QUEUE_BYTES = 512 * 1024
+MAX_FRONTEND_QUEUE_ITEM_BYTES = 128 * 1024
+MAX_POLL_MESSAGES = 32
+MAX_POLL_MESSAGE_BYTES = 128 * 1024
+MAX_ERROR_MESSAGE_CHARS = 512
 ONION_V3_RE = re.compile(r"(?<![a-z2-7])([a-z2-7]{56}\.onion)(?![a-z2-7.])", re.I)
 
 state_lock = threading.RLock()
@@ -81,7 +93,8 @@ _verification_peer_confirmed = False
 _peer_count = 0
 _active_room: Optional[dict[str, Any]] = None
 _connection_mode: Optional[str] = None
-_inbox: list[str] = []
+_inbox: deque[tuple[str, int]] = deque()
+_inbox_bytes = 0
 
 ADJECTIVES = ["midnight", "pixel", "sunset", "neon", "velvet", "silver", "echo", "lunar"]
 NOUNS = ["ocean", "dream", "chat", "signal", "harbor", "voyage", "cipher", "comet"]
@@ -110,6 +123,8 @@ def generate_random_room_name() -> str:
 
 def _friendly_error(exc: Exception) -> str:
     message = str(exc).strip()
+    if len(message) > MAX_ERROR_MESSAGE_CHARS:
+        message = message[: MAX_ERROR_MESSAGE_CHARS - 1] + "…"
     lowered = message.lower()
     if "tor executable not found" in lowered:
         return "Tor is unavailable. Install Tor for development or use a build that bundles it."
@@ -700,9 +715,31 @@ def confirm_verification() -> dict[str, Any]:
     }
 
 
-def _queue_frontend_message(message: str) -> None:
+def _serialized_message_size(message: str) -> int:
+    return len(json.dumps(message, separators=(",", ":")).encode("utf-8"))
+
+
+def _clear_frontend_messages() -> None:
+    global _inbox_bytes
     with inbox_lock:
-        _inbox.append(message)
+        _inbox.clear()
+        _inbox_bytes = 0
+
+
+def _queue_frontend_message(message: str) -> bool:
+    global _inbox_bytes
+    serialized_bytes = _serialized_message_size(message)
+    if serialized_bytes > MAX_FRONTEND_QUEUE_ITEM_BYTES:
+        return False
+    with inbox_lock:
+        if (
+            len(_inbox) >= MAX_FRONTEND_QUEUE_MESSAGES
+            or _inbox_bytes + serialized_bytes > MAX_FRONTEND_QUEUE_BYTES
+        ):
+            return False
+        _inbox.append((message, serialized_bytes))
+        _inbox_bytes += serialized_bytes
+        return True
 
 
 def _claim_active_peer_socket(conn: socket.socket) -> Optional[int]:
@@ -794,12 +831,20 @@ def _process_peer_frame(conn: socket.socket, generation: int, raw: bytes) -> boo
                 confirmed = _channel_status == "confirmed" and handshake_event.is_set()
         if box is None or not confirmed or not verified:
             raise RuntimeError("Participant verification is required before messaging")
-        plaintext = _decrypt_with_box(box, str(frame.get("ciphertext", "")))
-        if not _is_peer_session_owner(conn, generation):
-            return False
+        ciphertext = str(frame.get("ciphertext", ""))
+        if len(ciphertext) > MAX_ENCRYPTED_MESSAGE_CHARS:
+            raise ValueError("Peer chat message is too large")
+        plaintext = _decrypt_with_box(box, ciphertext)
+        if len(plaintext.encode("utf-8")) > MAX_CHAT_MESSAGE_BYTES:
+            raise ValueError("Peer chat message is too large")
         if plaintext == "__disconnect__":
             return False
-        _queue_frontend_message(plaintext)
+        with peer_lock:
+            if not _is_peer_session_owner_locked(conn, generation):
+                return False
+            if not _queue_frontend_message(plaintext):
+                _clear_frontend_messages()
+                raise RuntimeError("Peer exceeded pending message capacity")
         return True
     if kind == "disconnect":
         return False
@@ -811,6 +856,9 @@ def _process_peer_frame(conn: socket.socket, generation: int, raw: bytes) -> boo
 def _read_socket_messages(conn: socket.socket, generation: int) -> None:
     conn.settimeout(1)
     buffer = bytearray()
+    rate_window_started = time.monotonic()
+    rate_window_frames = 0
+    rate_window_bytes = 0
     while not stop_event.is_set():
         if not _is_peer_session_owner(conn, generation):
             return
@@ -824,7 +872,23 @@ def _read_socket_messages(conn: socket.socket, generation: int) -> None:
             while b"\n" in buffer:
                 raw, _, remainder = buffer.partition(b"\n")
                 buffer = bytearray(remainder)
-                if raw.strip() and not _process_peer_frame(conn, generation, bytes(raw)):
+                if not raw.strip():
+                    continue
+                if len(raw) > MAX_APPLICATION_FRAME_BYTES:
+                    raise ValueError("Peer application frame is too large")
+                now = time.monotonic()
+                if now - rate_window_started >= 1:
+                    rate_window_started = now
+                    rate_window_frames = 0
+                    rate_window_bytes = 0
+                rate_window_frames += 1
+                rate_window_bytes += len(raw)
+                if (
+                    rate_window_frames > MAX_INBOUND_FRAMES_PER_SECOND
+                    or rate_window_bytes > MAX_INBOUND_FRAME_BYTES_PER_SECOND
+                ):
+                    raise RuntimeError("Peer message rate limit exceeded")
+                if not _process_peer_frame(conn, generation, bytes(raw)):
                     return
         except socket.timeout:
             continue
@@ -1078,6 +1142,11 @@ def send_message(text: str) -> dict[str, str]:
     payload = text.strip()
     if not payload:
         return {"status": "error", "error": "Message cannot be empty"}
+    if len(payload.encode("utf-8")) > MAX_CHAT_MESSAGE_BYTES:
+        return {
+            "status": "error",
+            "error": f"Message exceeds the {MAX_CHAT_MESSAGE_BYTES // 1024} KiB limit",
+        }
     with peer_lock:
         conn = active_peer_socket
         generation = _active_peer_generation
@@ -1152,8 +1221,7 @@ def close_room() -> dict[str, str]:
     _stop_process(process)
     if data_dir:
         shutil.rmtree(data_dir, ignore_errors=True)
-    with inbox_lock:
-        _inbox.clear()
+    _clear_frontend_messages()
     return {"status": "closed"}
 
 
@@ -1182,9 +1250,19 @@ def build_room_response(room_name: str) -> dict[str, Any]:
 
 
 def poll_messages() -> dict[str, Any]:
+    global _inbox_bytes
     with inbox_lock:
-        messages = list(_inbox)
-        _inbox.clear()
+        messages: list[str] = []
+        message_bytes = 0
+        while _inbox and len(messages) < MAX_POLL_MESSAGES:
+            message, serialized_bytes = _inbox[0]
+            if messages and message_bytes + serialized_bytes > MAX_POLL_MESSAGE_BYTES:
+                break
+            _inbox.popleft()
+            _inbox_bytes -= serialized_bytes
+            messages.append(message)
+            message_bytes += serialized_bytes
+        messages_pending = len(_inbox)
     with state_lock:
         channel_status = _channel_status
         encrypted = (
@@ -1207,6 +1285,7 @@ def poll_messages() -> dict[str, Any]:
             identity_status = "unverified"
     return {
         "messages": messages,
+        "messages_pending": messages_pending,
         "channel_status": channel_status,
         "channel_error": channel_error,
         "encrypted": encrypted,
