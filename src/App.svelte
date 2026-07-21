@@ -20,6 +20,7 @@
     clearInvitationFromClipboard,
     writeInvitationToClipboard
   } from "./lib/invitationClipboard.js";
+  import { clearLegacyUsernamePreference } from "./lib/usernamePrivacy.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
   import { mapBackendTorState, torBadgeDescription, torBadgeText } from "./lib/torStatus.js";
 
@@ -83,7 +84,6 @@
   );
 
   const RETRO_SOUND_PREF_KEY = "mutinychat-retro-sounds-enabled";
-  const USERNAME_PREF_KEY = "mutinychat-username";
 
   /** @param {string} message */
   function showToast(message) {
@@ -569,16 +569,9 @@
     }
 
     try {
-      const savedUsername = window.localStorage.getItem(USERNAME_PREF_KEY);
-      if (savedUsername) {
-        const normalizedSavedName = savedUsername.trim();
-        if (normalizedSavedName) {
-          myUsername = normalizedSavedName;
-          usernameDraft = normalizedSavedName;
-        }
-      }
+      clearLegacyUsernamePreference(window.localStorage);
     } catch {
-      // Ignore localStorage availability issues.
+      // Legacy username cleanup is best-effort when storage is unavailable.
     }
 
     const pollMessages = async () => {
@@ -698,18 +691,6 @@
 
     try {
       window.localStorage.setItem(RETRO_SOUND_PREF_KEY, String(retroSoundsEnabled));
-    } catch {
-      // Ignore localStorage availability issues.
-    }
-  });
-
-  $effect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    try {
-      window.localStorage.setItem(USERNAME_PREF_KEY, myUsername);
     } catch {
       // Ignore localStorage availability issues.
     }

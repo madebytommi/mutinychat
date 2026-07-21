@@ -1,5 +1,4 @@
 stem==1.8.2
 PyNaCl==1.5.0
-cryptography==44.0.3
 PySocks==1.7.1
 pyinstaller==6.16.0

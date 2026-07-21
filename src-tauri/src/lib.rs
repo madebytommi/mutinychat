@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock, TryLockError};
@@ -304,60 +304,8 @@ fn backend_ipc(
     run_backend_command(&app, &command, message.as_deref(), room_name.as_deref())
 }
 
-fn push_executable_candidates(candidates: &mut Vec<PathBuf>, root: &Path) {
-    candidates.push(root.join("mutinychat-backend"));
-    candidates.push(root.join("backend/mutinychat-backend"));
-    candidates.push(root.join("backend/dist/mutinychat-backend"));
-    candidates.push(root.join("../backend/dist/mutinychat-backend"));
-
-    #[cfg(target_os = "windows")]
-    {
-        candidates.push(root.join("mutinychat-backend.exe"));
-        candidates.push(root.join("backend/mutinychat-backend.exe"));
-        candidates.push(root.join("backend/dist/mutinychat-backend.exe"));
-        candidates.push(root.join("../backend/dist/mutinychat-backend.exe"));
-    }
-}
-
-fn backend_exec_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    for root in backend_search_roots() {
-        push_executable_candidates(&mut candidates, &root);
-    }
-    candidates
-}
-
-fn backend_script_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    for root in backend_search_roots() {
-        candidates.push(root.join("backend/main.py"));
-        candidates.push(root.join("../backend/main.py"));
-    }
-    candidates
-}
-
-fn backend_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(mut dir) = exe_path.parent() {
-            for _ in 0..6 {
-                roots.push(dir.to_path_buf());
-                let Some(parent) = dir.parent() else {
-                    break;
-                };
-                dir = parent;
-            }
-        }
-    }
-
-    roots.sort();
-    roots.dedup();
-    roots
+fn development_backend_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../backend/main.py")
 }
 
 fn python_command(script: PathBuf) -> Command {
@@ -407,16 +355,13 @@ fn configure_backend_command(app: &tauri::AppHandle, command: &mut Command) -> R
 
     if tor_path.is_file() {
         command.env("MUTINYCHAT_TOR_PATH", &tor_path);
+        command.env("MUTINYCHAT_REQUIRE_BUNDLED_TOR", "1");
         command.current_dir(tor_directory);
     } else if !cfg!(debug_assertions) {
         return Err(format!(
             "Bundled Tor executable is missing at {}",
             tor_path.display()
         ));
-    }
-
-    if !cfg!(debug_assertions) {
-        command.env("MUTINYCHAT_REQUIRE_BUNDLED_TOR", "1");
     }
 
     #[cfg(target_os = "windows")]
@@ -437,19 +382,15 @@ fn resolve_backend_command(app: &tauri::AppHandle) -> Result<Command, String> {
         ));
     }
 
-    for script in backend_script_candidates() {
-        if script.exists() {
-            return Ok(python_command(script));
-        }
+    let script = development_backend_script();
+    if script.is_file() {
+        return Ok(python_command(script));
     }
 
-    for path in backend_exec_candidates() {
-        if path.is_file() {
-            return Ok(Command::new(path));
-        }
-    }
-
-    Err("Backend not found. Expected backend/main.py or a local mutinychat-backend executable in a development checkout.".to_string())
+    Err(format!(
+        "Development backend not found at the compile-time project path {}",
+        script.display()
+    ))
 }
 
 fn run_backend_command(
@@ -500,7 +441,6 @@ fn run_backend_command(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![backend_ipc])
         .build(tauri::generate_context!())
         .expect("error while building Tauri application");
@@ -515,14 +455,22 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_command_timeout, exchange_backend_command, finish_backend_command,
-        read_bounded_line, request_backend_close, wait_for_backend_response,
-        BACKEND_DEFAULT_RESPONSE_TIMEOUT, BACKEND_POLL_RESPONSE_TIMEOUT,
+        backend_command_timeout, development_backend_script, exchange_backend_command,
+        finish_backend_command, read_bounded_line, request_backend_close,
+        wait_for_backend_response, BACKEND_DEFAULT_RESPONSE_TIMEOUT, BACKEND_POLL_RESPONSE_TIMEOUT,
         BACKEND_TOR_RESPONSE_TIMEOUT, MAX_BACKEND_OUTPUT_LINE_BYTES,
     };
     use std::io::{Cursor, ErrorKind};
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn development_backend_is_bound_to_the_compile_time_checkout() {
+        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../backend/main.py");
+
+        assert_eq!(expected, development_backend_script());
+    }
 
     #[test]
     fn bounded_line_reader_accepts_normal_json() {

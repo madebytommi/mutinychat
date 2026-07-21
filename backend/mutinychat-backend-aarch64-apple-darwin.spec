@@ -6,11 +6,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['_cffi_backend'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['cryptography'],
     noarchive=False,
     optimize=0,
 )
