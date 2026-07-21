@@ -70,6 +70,9 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      - name: Reject tracked backend build artifacts
+        run: npm run check:repository-artifacts
+
       - name: Install frontend dependencies
         run: npm ci
 
