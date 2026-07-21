@@ -47,6 +47,7 @@ DEFAULT_ONION_PORT = 8080
 CONNECT_TIMEOUT = 20
 HANDSHAKE_TIMEOUT = 15
 MAX_FRAME_BYTES = 1024 * 1024
+MAX_HANDSHAKE_FRAME_BYTES = 16 * 1024
 MAX_APPLICATION_FRAME_BYTES = 64 * 1024
 MAX_CHAT_MESSAGE_BYTES = 16 * 1024
 MAX_ENCRYPTED_MESSAGE_CHARS = ((MAX_CHAT_MESSAGE_BYTES + 64 + 2) // 3) * 4
@@ -268,7 +269,15 @@ def start_tor() -> Controller:
         command = _resolve_tor_cmd()
         try:
             tor_process = stem.process.launch_tor_with_config(
-                config={"ControlPort": str(control_port), "SocksPort": str(active_socks_port), "DataDirectory": _tor_data_dir},
+                config={
+                    "ControlPort": f"127.0.0.1:{control_port}",
+                    "SocksPort": (
+                        f"127.0.0.1:{active_socks_port} IsolateSOCKSAuth"
+                    ),
+                    "CookieAuthentication": "1",
+                    "CookieAuthFileGroupReadable": "0",
+                    "DataDirectory": _tor_data_dir,
+                },
                 take_ownership=True,
                 tor_cmd=command,
             )
@@ -456,23 +465,32 @@ def _send_handshake_frame(
         conn.settimeout(previous_timeout)
 
 
-def _receive_handshake_frame(conn: socket.socket, deadline: float) -> dict[str, Any]:
+def _receive_handshake_frame(
+    conn: socket.socket,
+    deadline: float,
+    buffer: bytearray,
+) -> dict[str, Any]:
     previous_timeout = conn.gettimeout()
-    data = bytearray()
     try:
         while True:
+            newline = buffer.find(b"\n")
+            if newline >= 0:
+                if newline > MAX_HANDSHAKE_FRAME_BYTES:
+                    raise ValueError("Peer handshake frame is too large")
+                data = bytes(buffer[:newline])
+                del buffer[: newline + 1]
+                break
+            if len(buffer) > MAX_HANDSHAKE_FRAME_BYTES:
+                raise ValueError("Peer handshake frame is too large")
             try:
                 conn.settimeout(_handshake_time_remaining(deadline))
-                chunk = conn.recv(1)
+                remaining = MAX_HANDSHAKE_FRAME_BYTES + 1 - len(buffer)
+                chunk = conn.recv(min(4096, remaining))
             except socket.timeout as exc:
                 raise TimeoutError("Secure session handshake timed out") from exc
             if not chunk:
                 raise ConnectionError("Peer closed before the secure session handshake completed")
-            if chunk == b"\n":
-                break
-            data.extend(chunk)
-            if len(data) > MAX_FRAME_BYTES:
-                raise ValueError("Peer handshake frame is too large")
+            buffer.extend(chunk)
     finally:
         conn.settimeout(previous_timeout)
 
@@ -489,8 +507,9 @@ def _expect_handshake_frame(
     conn: socket.socket,
     expected_type: str,
     deadline: float,
+    buffer: bytearray,
 ) -> dict[str, Any]:
-    frame = _receive_handshake_frame(conn, deadline)
+    frame = _receive_handshake_frame(conn, deadline, buffer)
     kind = str(frame.get("type", ""))
     if kind == "error":
         raise RuntimeError(str(frame.get("message", "Peer refused the connection")))
@@ -551,7 +570,7 @@ def _perform_handshake(
     mode: str,
     generation: int,
     expected_host_public_key: Optional[bytes] = None,
-) -> None:
+) -> bytes:
     global _peer_public_key, _box, _handshake_transcript_hash, _connection_role
     global _channel_status, _channel_error
     global _verification_code
@@ -580,6 +599,7 @@ def _perform_handshake(
     local_nonce = secrets.token_bytes(HANDSHAKE_NONCE_BYTES)
     local_challenge = secrets.token_bytes(CHANNEL_CHALLENGE_BYTES)
     local_public_key = bytes(local_private_key.public_key)
+    receive_buffer = bytearray()
 
     try:
         _require_peer_session_owner(conn, generation)
@@ -594,7 +614,7 @@ def _perform_handshake(
             },
             deadline,
         )
-        frame = _expect_handshake_frame(conn, "hello", deadline)
+        frame = _expect_handshake_frame(conn, "hello", deadline, receive_buffer)
         if set(frame) != {"type", "v", "role", "public_key", "nonce"}:
             raise ValueError("Peer hello frame has unexpected fields")
         if frame.get("v") != PROTOCOL_VERSION:
@@ -637,7 +657,12 @@ def _perform_handshake(
             {"type": "channel_challenge", "ciphertext": challenge_ciphertext},
             deadline,
         )
-        challenge_frame = _expect_handshake_frame(conn, "channel_challenge", deadline)
+        challenge_frame = _expect_handshake_frame(
+            conn,
+            "channel_challenge",
+            deadline,
+            receive_buffer,
+        )
         if set(challenge_frame) != {"type", "ciphertext"}:
             raise ValueError("Peer channel challenge frame has unexpected fields")
         peer_challenge = parse_channel_challenge_payload(
@@ -658,7 +683,12 @@ def _perform_handshake(
             {"type": "channel_response", "ciphertext": response_ciphertext},
             deadline,
         )
-        response_frame = _expect_handshake_frame(conn, "channel_response", deadline)
+        response_frame = _expect_handshake_frame(
+            conn,
+            "channel_response",
+            deadline,
+            receive_buffer,
+        )
         if set(response_frame) != {"type", "ciphertext"}:
             raise ValueError("Peer channel response frame has unexpected fields")
         peer_response = parse_channel_response_payload(
@@ -692,6 +722,7 @@ def _perform_handshake(
                 _channel_status = "confirmed"
                 _channel_error = None
                 handshake_event.set()
+        return bytes(receive_buffer)
     except Exception as exc:
         _fail_channel_handshake(conn, generation, exc)
         raise
@@ -943,9 +974,13 @@ def _process_peer_frame(conn: socket.socket, generation: int, raw: bytes) -> boo
     raise ValueError(f"Unsupported peer frame type: {kind or '<empty>'}")
 
 
-def _read_socket_messages(conn: socket.socket, generation: int) -> None:
+def _read_socket_messages(
+    conn: socket.socket,
+    generation: int,
+    initial_buffer: bytes = b"",
+) -> None:
     conn.settimeout(1)
-    buffer = bytearray()
+    buffer = bytearray(initial_buffer)
     rate_window_started = time.monotonic()
     rate_window_frames = 0
     rate_window_bytes = 0
@@ -953,10 +988,11 @@ def _read_socket_messages(conn: socket.socket, generation: int) -> None:
         if not _is_peer_session_owner(conn, generation):
             return
         try:
-            chunk = conn.recv(4096)
-            if not chunk:
-                return
-            buffer.extend(chunk)
+            if b"\n" not in buffer:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buffer.extend(chunk)
             if len(buffer) > MAX_FRAME_BYTES and b"\n" not in buffer:
                 raise ValueError("Peer frame is too large")
             while b"\n" in buffer:
@@ -1029,13 +1065,22 @@ def _peer_session(
     generation: int,
     handshake_complete: bool = False,
     expected_host_public_key: Optional[bytes] = None,
+    initial_buffer: bytes = b"",
 ) -> None:
     global active_peer_socket, guest_socket, _active_peer_generation
     global _peer_count, _active_room, _connection_mode
     try:
         if not handshake_complete:
-            _perform_handshake(conn, mode, generation, expected_host_public_key)
-        _read_socket_messages(conn, generation)
+            initial_buffer = _perform_handshake(
+                conn,
+                mode,
+                generation,
+                expected_host_public_key,
+            )
+        if initial_buffer:
+            _read_socket_messages(conn, generation, initial_buffer)
+        else:
+            _read_socket_messages(conn, generation)
     finally:
         notification: Optional[str] = None
         with peer_lock:
@@ -1067,18 +1112,10 @@ def _peer_session(
             _queue_frontend_control(notification)
 
 
-def _handle_guest(conn: socket.socket) -> None:
+def _handle_guest(conn: socket.socket, generation: int) -> None:
     global _peer_count
-    generation = _claim_active_peer_socket(conn)
-    if generation is None:
-        try:
-            _send_frame(conn, {"type": "error", "message": "This room already has two participants"})
-        finally:
-            _close_socket(conn)
-        return
-
     try:
-        _perform_handshake(conn, "host", generation)
+        initial_buffer = _perform_handshake(conn, "host", generation)
     except Exception as exc:
         _release_failed_host_connection(conn, generation, exc)
         return
@@ -1090,7 +1127,13 @@ def _handle_guest(conn: socket.socket) -> None:
         with state_lock:
             _peer_count = 2
         _queue_frontend_control("peer_joined")
-    _peer_session(conn, "host", generation, handshake_complete=True)
+    _peer_session(
+        conn,
+        "host",
+        generation,
+        handshake_complete=True,
+        initial_buffer=initial_buffer,
+    )
 
 
 def _listener_loop(server: socket.socket) -> None:
@@ -1101,7 +1144,29 @@ def _listener_loop(server: socket.socket) -> None:
             continue
         except OSError:
             return
-        threading.Thread(target=_handle_guest, args=(conn,), daemon=True).start()
+        generation = _claim_active_peer_socket(conn)
+        if generation is None:
+            try:
+                _send_frame(
+                    conn,
+                    {
+                        "type": "error",
+                        "message": "This room already has two participants",
+                    },
+                )
+            except OSError:
+                pass
+            finally:
+                _close_socket(conn)
+            continue
+        try:
+            threading.Thread(
+                target=_handle_guest,
+                args=(conn, generation),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            _release_failed_host_connection(conn, generation, exc)
 
 
 def create_hidden_service(room_name: str) -> dict[str, Any]:
@@ -1162,7 +1227,13 @@ def join_room(invitation: str, port: int) -> dict[str, Any]:
     stop_event.clear()
     client = socks.socksocket()
     try:
-        client.set_proxy(socks.SOCKS5, "127.0.0.1", active_socks_port)
+        client.set_proxy(
+            socks.SOCKS5,
+            "127.0.0.1",
+            active_socks_port,
+            username=secrets.token_hex(32),
+            password=secrets.token_hex(32),
+        )
         client.settimeout(CONNECT_TIMEOUT)
         client.connect((onion_host, port))
         client.settimeout(1)
@@ -1192,7 +1263,7 @@ def join_room(invitation: str, port: int) -> dict[str, Any]:
                 "tor_generation": _tor_generation,
             }
     try:
-        _perform_handshake(
+        initial_buffer = _perform_handshake(
             client,
             "guest",
             generation,
@@ -1213,7 +1284,14 @@ def join_room(invitation: str, port: int) -> dict[str, Any]:
             code = _verification_code
     threading.Thread(
         target=_peer_session,
-        args=(client, "guest", generation, True, authenticated_invite.host_public_key),
+        args=(
+            client,
+            "guest",
+            generation,
+            True,
+            authenticated_invite.host_public_key,
+            initial_buffer,
+        ),
         daemon=True,
     ).start()
     return {

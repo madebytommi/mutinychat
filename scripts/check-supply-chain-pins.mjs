@@ -36,6 +36,12 @@ for (const name of workflowFiles) {
 }
 
 const windowsWorkflow = fs.readFileSync(path.join(workflowDirectory, "windows-release.yml"), "utf8");
+const ciWorkflow = fs.readFileSync(path.join(workflowDirectory, "ci.yml"), "utf8");
+const dependencyAudit = fs.readFileSync(
+  path.join(ROOT, "scripts", "run-dependency-audit.sh"),
+  "utf8",
+);
+const osvConfiguration = fs.readFileSync(path.join(ROOT, "osv-scanner.toml"), "utf8");
 if (!/^\s*GNUPG_VERSION:\s*"\d+\.\d+\.\d+"\s*$/m.test(windowsWorkflow)) {
   errors.push("windows-release.yml: GnuPG version must be exact");
 }
@@ -52,6 +58,46 @@ for (const variable of ["NODE_VERSION", "PYTHON_VERSION", "RUST_VERSION"]) {
 }
 if (/\bnpx\s+tauri\s+build\b/.test(windowsWorkflow)) {
   errors.push("windows-release.yml: npx must not download a missing Tauri CLI during a release build");
+}
+for (const [name, workflow] of [
+  ["ci.yml", ciWorkflow],
+  ["windows-release.yml", windowsWorkflow],
+]) {
+  if (!/bash scripts\/run-dependency-audit\.sh/.test(workflow)) {
+    errors.push(`${name}: dependency vulnerability audit is not enforced`);
+  }
+}
+if (!/^OSV_VERSION="2\.3\.8"$/m.test(dependencyAudit)) {
+  errors.push("run-dependency-audit.sh: OSV Scanner version must be exact");
+}
+if (!/^OSV_SHA256="[0-9a-f]{64}"$/m.test(dependencyAudit)) {
+  errors.push("run-dependency-audit.sh: OSV Scanner SHA-256 must be pinned");
+}
+if (!/sha256sum --check --strict/.test(dependencyAudit)) {
+  errors.push("run-dependency-audit.sh: OSV Scanner hash must be verified before execution");
+}
+if (!dependencyAudit.includes("--config=osv-scanner.toml")) {
+  errors.push("run-dependency-audit.sh: reviewed OSV exception policy is not applied");
+}
+for (const lockfile of [
+  "package-lock.json",
+  "src-tauri/Cargo.lock",
+  "requirements.txt:backend/requirements.txt",
+  "requirements.txt:backend/requirements-windows.lock",
+]) {
+  if (!dependencyAudit.includes(`--lockfile=${lockfile}`)) {
+    errors.push(`run-dependency-audit.sh: missing vulnerability scan input ${lockfile}`);
+  }
+}
+const osvExceptions = osvConfiguration.split("[[IgnoredVulns]]").slice(1);
+for (const exception of osvExceptions) {
+  const id = exception.match(/^id\s*=\s*"([^"]+)"/m)?.[1] ?? "<unknown>";
+  if (!/^ignoreUntil\s*=\s*\d{4}-\d{2}-\d{2}\s*$/m.test(exception)) {
+    errors.push(`osv-scanner.toml: ${id} exception must have an expiration date`);
+  }
+  if (!/^reason\s*=\s*".{20,}"\s*$/m.test(exception)) {
+    errors.push(`osv-scanner.toml: ${id} exception must have a specific review reason`);
+  }
 }
 
 for (const relativePath of ["backend/requirements.txt", "backend/requirements-windows.lock"]) {

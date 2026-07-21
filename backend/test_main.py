@@ -7,7 +7,7 @@ from unittest import mock
 import nacl.exceptions
 from nacl.public import Box, PrivateKey
 
-from participant_auth import build_confirmation_payload, derive_safety_code
+from participant_auth import build_confirmation_payload, build_invite, derive_safety_code
 import main as backend
 
 
@@ -221,6 +221,53 @@ class BackendTestCase(unittest.TestCase):
         stale_controller.close.assert_called_once()
         stale_process.terminate.assert_called_once()
         new_controller.authenticate.assert_called_once()
+        tor_config = launch_tor_with_config.call_args.kwargs["config"]
+        self.assertRegex(tor_config["ControlPort"], r"^127\.0\.0\.1:\d+$")
+        self.assertRegex(
+            tor_config["SocksPort"],
+            r"^127\.0\.0\.1:\d+ IsolateSOCKSAuth$",
+        )
+        self.assertEqual("1", tor_config["CookieAuthentication"])
+        self.assertEqual("0", tor_config["CookieAuthFileGroupReadable"])
+        self.assertEqual(backend._tor_data_dir, tor_config["DataDirectory"])
+
+    @mock.patch.object(backend.threading, "Thread")
+    @mock.patch.object(backend, "_perform_handshake")
+    @mock.patch.object(backend, "start_tor")
+    @mock.patch.object(backend.socks, "socksocket")
+    def test_join_room_uses_fresh_socks_credentials_for_stream_isolation(
+        self,
+        socksocket,
+        start_tor,
+        _perform_handshake,
+        _thread,
+    ):
+        client = mock.MagicMock()
+        socksocket.return_value = client
+
+        def mark_tor_ready():
+            backend.active_socks_port = 45678
+            return mock.MagicMock()
+
+        start_tor.side_effect = mark_tor_ready
+        host = PrivateKey.generate()
+        invitation = build_invite("a" * 56 + ".onion", bytes(host.public_key))
+
+        with mock.patch.object(
+            backend.secrets,
+            "token_hex",
+            side_effect=["session-user", "session-password"],
+        ) as token_hex:
+            backend.join_room(invitation, backend.DEFAULT_ONION_PORT)
+
+        token_hex.assert_has_calls([mock.call(32), mock.call(32)])
+        client.set_proxy.assert_called_once_with(
+            backend.socks.SOCKS5,
+            "127.0.0.1",
+            45678,
+            username="session-user",
+            password="session-password",
+        )
 
     def test_empty_message_is_rejected(self):
         self.assertEqual(
@@ -275,6 +322,75 @@ class BackendTestCase(unittest.TestCase):
             left.close()
             right.close()
 
+    def test_handshake_reader_uses_chunks_and_preserves_coalesced_frames(self):
+        conn = mock.MagicMock()
+        conn.gettimeout.return_value = None
+        conn.recv.return_value = b'{"type":"first"}\n{"type":"second"}\n'
+        buffer = bytearray()
+        deadline = backend.time.monotonic() + 1
+
+        first = backend._receive_handshake_frame(conn, deadline, buffer)
+        second = backend._receive_handshake_frame(conn, deadline, buffer)
+
+        self.assertEqual({"type": "first"}, first)
+        self.assertEqual({"type": "second"}, second)
+        conn.recv.assert_called_once_with(4096)
+        self.assertEqual(bytearray(), buffer)
+
+    def test_handshake_reader_rejects_frame_over_its_dedicated_limit(self):
+        conn = mock.MagicMock()
+        conn.gettimeout.return_value = None
+        conn.recv.side_effect = lambda size: b"x" * size
+
+        with self.assertRaisesRegex(ValueError, "handshake frame is too large"):
+            backend._receive_handshake_frame(
+                conn,
+                backend.time.monotonic() + 1,
+                bytearray(),
+            )
+
+        self.assertEqual(5, conn.recv.call_count)
+
+    @mock.patch.object(backend.threading, "Thread")
+    def test_listener_reserves_slot_before_starting_only_one_worker(self, thread):
+        server = mock.MagicMock()
+        first = mock.MagicMock()
+        second = mock.MagicMock()
+        server.accept.side_effect = [
+            (first, ("127.0.0.1", 1)),
+            (second, ("127.0.0.1", 2)),
+            OSError("listener stopped"),
+        ]
+
+        backend._listener_loop(server)
+
+        thread.assert_called_once_with(
+            target=backend._handle_guest,
+            args=(first, mock.ANY),
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once()
+        self.assertIs(backend.active_peer_socket, first)
+        second.sendall.assert_called_once()
+        rejected = json.loads(second.sendall.call_args.args[0].decode("utf-8"))
+        self.assertEqual("error", rejected["type"])
+        second.close.assert_called_once()
+
+    @mock.patch.object(backend.threading, "Thread")
+    def test_listener_releases_reserved_slot_when_worker_cannot_start(self, thread):
+        server = mock.MagicMock()
+        conn = mock.MagicMock()
+        server.accept.side_effect = [
+            (conn, ("127.0.0.1", 1)),
+            OSError("listener stopped"),
+        ]
+        thread.return_value.start.side_effect = RuntimeError("thread unavailable")
+
+        backend._listener_loop(server)
+
+        self.assertIsNone(backend.active_peer_socket)
+        conn.close.assert_called_once()
+
     @mock.patch.object(backend, "_perform_handshake", side_effect=RuntimeError("failed"))
     def test_host_peer_count_is_not_promoted_when_handshake_fails(self, _perform_handshake):
         left, right = socket.socketpair()
@@ -282,7 +398,9 @@ class BackendTestCase(unittest.TestCase):
         backend._active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
         backend._peer_count = 1
         try:
-            backend._handle_guest(left)
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            backend._handle_guest(left, generation)
 
             self.assertEqual(1, backend._peer_count)
             self.assertIsNone(backend.active_peer_socket)
@@ -302,7 +420,10 @@ class BackendTestCase(unittest.TestCase):
         backend._active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
         backend._peer_count = 1
         try:
-            backend._handle_guest(left)
+            generation = backend._claim_active_peer_socket(left)
+            self.assertIsNotNone(generation)
+            _perform_handshake.return_value = b""
+            backend._handle_guest(left, generation)
 
             _perform_handshake.assert_called_once()
             self.assertEqual(2, backend._peer_count)
@@ -311,6 +432,7 @@ class BackendTestCase(unittest.TestCase):
                 "host",
                 mock.ANY,
                 handshake_complete=True,
+                initial_buffer=b"",
             )
         finally:
             left.close()

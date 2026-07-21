@@ -6,11 +6,20 @@ on:
       - main
       - "chatgpt/**"
   pull_request:
+  schedule:
+    - cron: "17 9 * * 1"
 
 permissions:
   contents: read
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Reject dependencies with unreviewed known vulnerabilities
+        run: bash scripts/run-dependency-audit.sh
+
   frontend:
     runs-on: ubuntu-22.04
     steps:

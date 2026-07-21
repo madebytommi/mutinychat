@@ -39,7 +39,20 @@ env:
   TOR_SIGNING_FINGERPRINT: EF6E286DDA85EA2A4BA7DE684E2C6E8793298290
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
+      - name: Reject dependencies with unreviewed known vulnerabilities
+        run: bash scripts/run-dependency-audit.sh
+
   build-windows:
+    needs: dependency-audit
     runs-on: windows-2022
     timeout-minutes: 60
     permissions:
