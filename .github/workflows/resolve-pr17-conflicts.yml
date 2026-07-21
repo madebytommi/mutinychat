@@ -1,0 +1,111 @@
+name: Resolve PR 17 conflicts
+
+on:
+  push:
+    branches:
+      - codex/c17-c20-local-hardening
+
+permissions:
+  contents: write
+
+concurrency:
+  group: resolve-pr17-conflicts
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: codex/c17-c20-local-hardening
+
+      - name: Merge main and resolve known conflicts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "main is already merged into this branch"
+            exit 0
+          fi
+
+          set +e
+          git merge --no-ff --no-commit origin/main
+          merge_status=$?
+          set -e
+
+          if [ "$merge_status" -ne 0 ]; then
+            for path in \
+              README.md \
+              backend/requirements.txt \
+              backend/requirements-windows.lock \
+              package.json \
+              src/App.svelte
+            do
+              if git ls-files -u -- "$path" | grep -q .; then
+                git checkout --ours -- "$path"
+              fi
+            done
+          fi
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/App.svelte")
+          text = path.read_text(encoding="utf-8")
+
+          import_anchor = '  import { onMount } from "svelte";\n'
+          metadata_import = '  import packageMetadata from "../package.json";\n'
+          if metadata_import not in text:
+              if import_anchor not in text:
+                  raise SystemExit("Could not find the Svelte import anchor")
+              text = text.replace(import_anchor, import_anchor + metadata_import, 1)
+
+          typedef_anchor = (
+              '  /** @typedef {{ id: number, text: string, isMine: boolean, '
+              'sender: string }} ChatMessage */\n\n'
+          )
+          version_constant = '  const APP_VERSION = packageMetadata.version;\n\n'
+          if version_constant not in text:
+              if typedef_anchor not in text:
+                  raise SystemExit("Could not find the app-version constant anchor")
+              text = text.replace(typedef_anchor, typedef_anchor + version_constant, 1)
+
+          old_version = (
+              '<span class="app-version position-absolute small text-muted" '
+              'aria-label="version">v0.1.0</span>'
+          )
+          new_version = (
+              '<span class="app-version position-absolute small text-muted" '
+              'aria-label="version">v{APP_VERSION}</span>'
+          )
+          if new_version not in text:
+              if old_version not in text:
+                  raise SystemExit("Could not find the app-version display")
+              text = text.replace(old_version, new_version, 1)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          cat > .gitattributes <<'EOF'
+          # Auto detect text files and perform LF normalization
+          * text=auto
+          EOF
+
+          rm -f .github/workflows/resolve-pr17-conflicts.yml
+          git add -A
+
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "Unresolved merge entries remain:"
+            git ls-files -u
+            exit 1
+          fi
+
+          git commit -m "Merge main into PR 17 and resolve conflicts"
+          git push origin HEAD:codex/c17-c20-local-hardening
