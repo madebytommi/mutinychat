@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# PR #17 and PR #16 make independent changes in the large Svelte component.
+src/App.svelte merge=union
