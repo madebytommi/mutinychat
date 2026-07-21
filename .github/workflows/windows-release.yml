@@ -143,11 +143,46 @@ jobs:
           if ($PackageHash -ne $env:GNUPG_PACKAGE_SHA256) {
             throw "GnuPG Chocolatey package hash mismatch: $PackageHash"
           }
-          choco install gnupg --version $env:GNUPG_VERSION --source $PackageDirectory --allow-downgrade -y --no-progress
-          $ChocolateyBin = Join-Path $env:ChocolateyInstall "bin"
-          $env:PATH = "$ChocolateyBin;$env:PATH"
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value $ChocolateyBin
-          $GpgVersion = (gpg.exe --version | Select-Object -First 1)
+          $ExpandedPackageDirectory = Join-Path $PackageDirectory "expanded"
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($PackagePath, $ExpandedPackageDirectory)
+          $Installers = @(Get-ChildItem -LiteralPath (Join-Path $ExpandedPackageDirectory "tools") -Filter "gnupg-w32-*.exe" -File)
+          if ($Installers.Count -ne 1) {
+            throw "Expected exactly one GnuPG installer in the verified package, found $($Installers.Count)"
+          }
+
+          $InstallDirectory = Join-Path $env:RUNNER_TEMP "gnupg-$env:GNUPG_VERSION"
+          $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $StartInfo.FileName = $Installers[0].FullName
+          $StartInfo.ArgumentList.Add("/S")
+          $StartInfo.ArgumentList.Add("/D=$InstallDirectory")
+          $StartInfo.UseShellExecute = $false
+          $StartInfo.CreateNoWindow = $true
+          $InstallerProcess = [System.Diagnostics.Process]::new()
+          $InstallerProcess.StartInfo = $StartInfo
+          if (-not $InstallerProcess.Start()) {
+            throw "Failed to start the verified GnuPG installer"
+          }
+          try {
+            if (-not $InstallerProcess.WaitForExit(300000)) {
+              $InstallerProcess.Kill($true)
+              throw "Verified GnuPG installer did not exit within 5 minutes"
+            }
+            if ($InstallerProcess.ExitCode -ne 0) {
+              throw "Verified GnuPG installer failed with exit code $($InstallerProcess.ExitCode)"
+            }
+          }
+          finally {
+            $InstallerProcess.Dispose()
+          }
+
+          $GpgPath = Join-Path $InstallDirectory "bin\gpg.exe"
+          if (-not (Test-Path -LiteralPath $GpgPath -PathType Leaf)) {
+            throw "Verified GnuPG installation did not produce $GpgPath"
+          }
+          $GpgDirectory = Split-Path -Parent $GpgPath
+          $env:PATH = "$GpgDirectory;$env:PATH"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $GpgDirectory
+          $GpgVersion = (& $GpgPath --version | Select-Object -First 1)
           if ($GpgVersion -notmatch [regex]::Escape($env:GNUPG_VERSION)) {
             throw "Expected GnuPG $env:GNUPG_VERSION but received: $GpgVersion"
           }
