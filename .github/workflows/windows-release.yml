@@ -150,35 +150,20 @@ jobs:
             throw "Expected exactly one GnuPG installer in the verified package, found $($Installers.Count)"
           }
 
-          $InstallDirectory = Join-Path $env:RUNNER_TEMP "gnupg-$env:GNUPG_VERSION"
-          $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-          $StartInfo.FileName = $Installers[0].FullName
-          $StartInfo.ArgumentList.Add("/S")
-          $StartInfo.ArgumentList.Add("/D=$InstallDirectory")
-          $StartInfo.UseShellExecute = $false
-          $StartInfo.CreateNoWindow = $true
-          $InstallerProcess = [System.Diagnostics.Process]::new()
-          $InstallerProcess.StartInfo = $StartInfo
-          if (-not $InstallerProcess.Start()) {
-            throw "Failed to start the verified GnuPG installer"
+          $SevenZipPath = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+            throw "Windows runner is missing the expected 7-Zip executable: $SevenZipPath"
           }
-          try {
-            if (-not $InstallerProcess.WaitForExit(300000)) {
-              $InstallerProcess.Kill($true)
-              throw "Verified GnuPG installer did not exit within 5 minutes"
-            }
-            if ($InstallerProcess.ExitCode -ne 0) {
-              throw "Verified GnuPG installer failed with exit code $($InstallerProcess.ExitCode)"
-            }
+          $RuntimeDirectory = Join-Path $env:RUNNER_TEMP "gnupg-$env:GNUPG_VERSION"
+          & $SevenZipPath x $Installers[0].FullName "-o$RuntimeDirectory" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract the verified GnuPG runtime (7-Zip exit code $LASTEXITCODE)"
           }
-          finally {
-            $InstallerProcess.Dispose()
+          $GpgExecutables = @(Get-ChildItem -LiteralPath $RuntimeDirectory -Recurse -Filter "gpg.exe" -File)
+          if ($GpgExecutables.Count -ne 1) {
+            throw "Expected exactly one gpg.exe in the verified runtime, found $($GpgExecutables.Count)"
           }
-
-          $GpgPath = Join-Path $InstallDirectory "bin\gpg.exe"
-          if (-not (Test-Path -LiteralPath $GpgPath -PathType Leaf)) {
-            throw "Verified GnuPG installation did not produce $GpgPath"
-          }
+          $GpgPath = $GpgExecutables[0].FullName
           $GpgDirectory = Split-Path -Parent $GpgPath
           $env:PATH = "$GpgDirectory;$env:PATH"
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $GpgDirectory
