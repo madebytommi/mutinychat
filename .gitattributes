@@ -1,5 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
-# PR #17 and PR #16 make independent changes in the large Svelte component.
+# Temporary conflict-resolution rules for synchronizing PR #17 with PR #16.
+README.md merge=union
+backend/requirements.txt merge=union
+backend/requirements-windows.lock merge=union
+package.json merge=union
 src/App.svelte merge=union
