@@ -16,6 +16,9 @@
     "test:frontend": "node tests/frontend/channelStatus.test.js && node tests/frontend/messageHistory.test.js && node tests/frontend/frontendEvents.test.js && node tests/frontend/torStatus.test.js && node tests/frontend/connectionStatus.test.js && node tests/frontend/backendPoll.test.js && node tests/frontend/invitationClipboard.test.js",
     "check:frontend-network": "node scripts/check-frontend-network-resources.mjs",
     "check:tauri-csp": "node scripts/check-tauri-csp.mjs",
+    "check:release-policy": "node scripts/check-release-version.mjs && node scripts/check-release-policy.mjs",
+    "check:release-version": "node scripts/check-release-version.mjs",
+    "check:supply-chain": "node scripts/check-supply-chain-pins.mjs",
     "test:packaged:macos": "./scripts/test-packaged-macos.sh",
     "tauri": "tauri"
   },

@@ -21,7 +21,7 @@ Implemented:
 
 ## Windows downloads
 
-Tagged releases are built by GitHub Actions on `windows-latest` for `x86_64-pc-windows-msvc`.
+Release candidates are built by GitHub Actions on the `windows-2022` runner generation for `x86_64-pc-windows-msvc`.
 
 Release artifacts include:
 
@@ -29,12 +29,13 @@ Release artifacts include:
 - An MSI installer when Tauri produces one successfully
 - A portable Windows ZIP
 - `SHA256SUMS.txt`
+- A GitHub build-provenance attestation for every tagged artifact
 
 The Windows package bundles the compiled MutinyChat application, a self-contained PyInstaller backend, and the official Tor Expert Bundle runtime. End users do not need Python, Tor Browser, Node.js, Rust, Git, or developer tools.
 
 ### Unsigned-build warning
 
-Current Windows builds are unsigned. Microsoft Defender SmartScreen may warn that the publisher is unknown. Review the GitHub release, verify the SHA-256 checksum, and make an informed choice. Do not disable antivirus or Windows security protections.
+Current Windows builds are unsigned. Microsoft Defender SmartScreen may warn that the publisher is unknown. Verify both the GitHub build-provenance attestation and the SHA-256 checksum before running a download. The attestation ties an artifact to this repository's release workflow, but it is not Windows Authenticode signing and does not establish an independent publisher identity. Do not disable antivirus or Windows security protections.
 
 ### Installer
 
@@ -106,6 +107,8 @@ python -m venv .venv
 python -m pip install -r backend/requirements.txt
 ```
 
+The Python requirements use exact versions and SHA-256 hashes. Updating a package requires an intentional version-and-hash review.
+
 Run desktop development mode:
 
 ```bash
@@ -123,13 +126,13 @@ npm run build
 npm run check:frontend-network
 npm run build:backend:windows
 npm run prepare:tor:windows
-npx tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi
+npx --no-install tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi
 npm run verify:package:windows
 ```
 
 The frontend privacy check inspects runtime frontend source, static assets, and compiled output. It rejects unexpected `http://` or `https://` resources so third-party audio, fonts, images, scripts, and styles cannot be silently reintroduced.
 
-The backend build uses pinned packages from `backend/requirements-windows.lock` and produces:
+The backend build uses exact, hash-checked runtime and packaging dependencies from `backend/requirements-windows.lock` and produces:
 
 `backend/dist/mutinychat-backend-x86_64-pc-windows-msvc.exe`
 
@@ -151,7 +154,27 @@ GnuPG must successfully verify the detached signature before packaging continues
 
 Pull requests run the Windows build and upload temporary Actions artifacts for review. They do not publish GitHub Releases.
 
-A tag matching `v*`, such as `v0.1.0`, runs the same verified build and publishes the resulting Windows artifacts through GitHub Releases. `SHA256SUMS.txt` is generated from the final files.
+Pushing a tag does not run or publish a release. A maintainer must manually dispatch the Windows workflow with an existing `vX.Y.Z` tag. The requested tag must point at the checked-out commit and exactly match the versions in `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and `tauri.conf.json`.
+
+When draft creation is explicitly requested, the workflow builds that tag, generates `SHA256SUMS.txt`, creates GitHub OIDC build-provenance attestations for the artifacts, and creates a draft GitHub Release. Publishing the draft is a separate human action. Configure required reviewers on the repository's `release` environment so draft creation also requires approval.
+
+Before creating a release tag, update every application manifest to the same semantic version and run:
+
+```bash
+npm run check:release-policy
+npm run check:supply-chain
+```
+
+GitHub Actions are pinned to full commit SHAs, Node.js, Python, Rust, and GnuPG use exact versions, npm installs from its integrity-checked lockfile, Cargo runs with its checked-in lockfile, and Python installs require matching hashes.
+
+To verify a downloaded release artifact against GitHub's provenance record and then its checksum:
+
+```bash
+gh attestation verify MutinyChat_0.1.0_windows_x86_64_portable.zip --repo madebytommi/mutinychat
+sha256sum --check SHA256SUMS.txt
+```
+
+Replace the example version and filename with the release being verified. GitHub CLI verification requires network access to GitHub's attestation service.
 
 ## Automated Windows checks
 
@@ -159,6 +182,8 @@ The Windows workflow checks:
 
 - Frontend type checking and production build
 - Absence of unexpected external frontend runtime resources
+- Consistent application and release versions
+- Immutable GitHub Action and Python package references
 - Python compilation and unit tests
 - Self-contained backend CLI ping
 - Backend stdio JSON ping
@@ -196,6 +221,7 @@ These steps are required before calling a release fully verified. They are not m
 ## Known limitations
 
 - Windows builds are unsigned and may trigger SmartScreen.
+- GitHub provenance attestations depend on GitHub Actions, GitHub's OIDC identity, and the repository workflow remaining trustworthy; they are not a substitute for Authenticode signing with a separately protected publisher key.
 - CI cannot prove two-peer Tor connectivity on separate machines.
 - First-contact identity still requires the two people to compare the safety code through a separate trusted channel; the app cannot automatically know a person's real-world identity.
 - The cryptographic and networking design has not received an independent professional audit.
