@@ -28,3 +28,11 @@ src-tauri/resources/data/*
 
 # Rust / Tauri
 src-tauri/target/
+
+# Local project planning documents
+/VISION.md
+/DESIGN_SYSTEM.md
+/MVP.md
+/PROJECT_RULES.md
+/IMPLEMENTATION_PLAN.md
+/READINESS_REPORT.md
