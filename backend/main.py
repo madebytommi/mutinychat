@@ -164,16 +164,32 @@ def _runtime_roots() -> list[Path]:
     return roots
 
 
+def _is_executable_file(candidate: Path) -> bool:
+    return candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK))
+
+
 def _resolve_tor_cmd() -> str:
-    candidates: list[Path] = []
     configured = os.environ.get("MUTINYCHAT_TOR_PATH", "").strip()
+    require_bundled = os.environ.get("MUTINYCHAT_REQUIRE_BUNDLED_TOR", "").strip() == "1"
+
+    if require_bundled:
+        if not configured:
+            raise RuntimeError("Bundled Tor is required but no executable path was configured")
+        bundled_candidate = Path(configured).expanduser()
+        if not bundled_candidate.is_absolute():
+            raise RuntimeError("Bundled Tor requires an absolute executable path")
+        if _is_executable_file(bundled_candidate):
+            return str(bundled_candidate)
+        raise RuntimeError("Required bundled Tor executable is missing or not executable")
+
+    candidates: list[Path] = []
     if configured:
         candidates.append(Path(configured).expanduser())
     for root in _runtime_roots():
         candidates.extend([root / "tor", root / "tor.exe"])
     candidates.extend([Path("/opt/homebrew/bin/tor"), Path("/usr/local/bin/tor"), Path("/usr/bin/tor")])
     for candidate in candidates:
-        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+        if _is_executable_file(candidate):
             return str(candidate)
     found = shutil.which("tor") or shutil.which("tor.exe")
     if found:

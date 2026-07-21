@@ -58,6 +58,50 @@ class BackendTestCase(unittest.TestCase):
         self.assertIn(parts[1], backend.NOUNS)
         self.assertTrue(parts[2].isdigit())
 
+    def test_bundled_tor_requirement_rejects_missing_configured_path_without_fallback(self):
+        missing_path = str(backend.Path.cwd() / "missing" / "mutinychat" / "tor")
+        with mock.patch.dict(
+            backend.os.environ,
+            {
+                "MUTINYCHAT_REQUIRE_BUNDLED_TOR": "1",
+                "MUTINYCHAT_TOR_PATH": missing_path,
+            },
+            clear=False,
+        ), mock.patch.object(
+            backend, "_is_executable_file", return_value=False
+        ) as is_executable, mock.patch.object(
+            backend.shutil, "which", return_value="C:/attacker/tor.exe"
+        ) as which:
+            with self.assertRaisesRegex(RuntimeError, "Required bundled Tor"):
+                backend._resolve_tor_cmd()
+
+        is_executable.assert_called_once()
+        which.assert_not_called()
+
+    def test_bundled_tor_requirement_accepts_only_configured_absolute_path(self):
+        configured = str(backend.Path.cwd() / "bundled-tor-test")
+        with mock.patch.dict(
+            backend.os.environ,
+            {
+                "MUTINYCHAT_REQUIRE_BUNDLED_TOR": "1",
+                "MUTINYCHAT_TOR_PATH": configured,
+            },
+            clear=False,
+        ), mock.patch.object(backend, "_is_executable_file", return_value=True):
+            self.assertEqual(configured, backend._resolve_tor_cmd())
+
+    def test_bundled_tor_requirement_rejects_relative_path(self):
+        with mock.patch.dict(
+            backend.os.environ,
+            {
+                "MUTINYCHAT_REQUIRE_BUNDLED_TOR": "1",
+                "MUTINYCHAT_TOR_PATH": "tor.exe",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "absolute executable path"):
+                backend._resolve_tor_cmd()
+
     def test_extract_onion_host_accepts_v3_address_in_share_link(self):
         onion = "a" * 56 + ".onion"
         self.assertEqual(onion, backend._extract_onion_host(f"Join room → {onion}"))

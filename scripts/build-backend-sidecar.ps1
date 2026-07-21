@@ -64,8 +64,8 @@ $PyInstallerArgs = @(
     "--workpath", $BuildDir,
     "--specpath", $BuildDir,
     "--collect-all", "nacl",
-    "--collect-all", "cryptography",
-    "--collect-all", "stem",
+    "--exclude-module", "cryptography",
+    "--hidden-import", "_cffi_backend",
     "--hidden-import", "socks",
     $EntryPoint
 )

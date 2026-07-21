@@ -53,6 +53,7 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - SPA mode using `adapter-static`
 - Bootstrap imported from npm
 - Main UI in `src/App.svelte`
+- Usernames are session-only; startup removes the legacy persisted username preference
 - Retro notification sounds synthesized locally with the Web Audio API
 - No sound-effect file or third-party sound service is loaded at runtime
 
@@ -62,6 +63,7 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - Static frontend assets in production
 - One managed backend process over stdio JSON
 - Release builds resolve the backend and Tor from Tauri's application resource directory
+- Development builds run `backend/main.py` only from the checkout recorded at compile time
 - Windows child processes are launched without persistent console windows
 
 ### Backend
@@ -72,6 +74,7 @@ Extract the portable ZIP as a complete folder and run `mutinychat.exe`. Keep `mu
 - Invitation-bound host keys plus a session safety code derived from both ephemeral keys and the onion address
 - Chat remains locked until both participants confirm that they compared the same safety code
 - Runtime Tor data stored in a temporary writable directory and removed during normal shutdown
+- Packaged builds require the exact bundled Tor path and fail closed if it is unavailable
 - Room messages are kept in process memory and removed from the visible chat when the room closes; this is not secure erasure of memory, swap, or crash data
 
 ## Repository layout
@@ -238,6 +241,7 @@ These steps are required before calling a release fully verified. They are not m
 - An authenticated invitation detects a host-key mismatch, while the safety-code comparison detects full invitation substitution when users compare it through an independent trusted channel.
 - Never confirm a safety code without actually comparing it with the intended participant. A user who blindly confirms can still accept an attacker.
 - Verification applies only to the current ephemeral session and does not create a persistent identity or contact record.
+- The chosen username is retained only for the current WebView session and is not written to persistent browser storage.
 - Do not treat prototype status as a guarantee of anonymity or security.
 - Do not expose encryption material in logs or bug reports.
 - Code signing can be added later using protected CI secrets; no private signing material belongs in the repository.
