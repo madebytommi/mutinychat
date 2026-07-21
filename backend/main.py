@@ -1169,43 +1169,54 @@ def _listener_loop(server: socket.socket) -> None:
             _release_failed_host_connection(conn, generation, exc)
 
 
-def create_hidden_service(room_name: str) -> dict[str, Any]:
-    del room_name
-    global active_service_id, active_local_port
-    controller = start_tor()
-    local_port = _pick_random_port()
-    service = controller.create_ephemeral_hidden_service(
-        {DEFAULT_ONION_PORT: f"127.0.0.1:{local_port}"}, await_publication=True
-    )
-    active_service_id = service.service_id
-    active_local_port = local_port
-    return {"onion_address": f"{service.service_id}.onion", "port": DEFAULT_ONION_PORT}
+def _require_room_inactive() -> None:
+    with peer_lock:
+        with state_lock:
+            room_resources_active = any(
+                (
+                    _active_room is not None,
+                    _connection_mode is not None,
+                    active_service_id is not None,
+                    active_local_port is not None,
+                    listener_socket is not None,
+                    listener_thread is not None,
+                    guest_socket is not None,
+                    active_peer_socket is not None,
+                )
+            )
+    if room_resources_active:
+        raise RuntimeError("Close the current room before starting another room operation")
 
 
-def start_listening(port: Optional[int] = None) -> dict[str, Any]:
-    global listener_thread, listener_socket
-    with state_lock:
-        if _connection_mode != "host" or _active_room is None:
-            raise RuntimeError("Create a room before starting the listener")
-        if listener_thread is not None and listener_thread.is_alive():
-            return {"status": "listening", "port": active_local_port}
-        listen_port = port or active_local_port
-    if not listen_port:
-        raise RuntimeError("Room listener port is unavailable")
+def _bind_room_listener() -> tuple[socket.socket, int]:
     server = socket.socket()
     try:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("127.0.0.1", listen_port))
+        server.bind(("127.0.0.1", 0))
         server.listen(1)
         server.settimeout(1)
+        local_port = int(server.getsockname()[1])
     except Exception:
         server.close()
         raise
-    stop_event.clear()
-    listener_socket = server
-    listener_thread = threading.Thread(target=_listener_loop, args=(server,), daemon=True)
-    listener_thread.start()
-    return {"status": "listening", "port": listen_port}
+    if not local_port:
+        server.close()
+        raise RuntimeError("Room listener port is unavailable")
+    return server, local_port
+
+
+def create_hidden_service(controller: Controller, local_port: int) -> dict[str, Any]:
+    service = controller.create_ephemeral_hidden_service(
+        {DEFAULT_ONION_PORT: f"127.0.0.1:{local_port}"}, await_publication=True
+    )
+    service_id = str(service.service_id).strip()
+    if not service_id:
+        raise RuntimeError("Tor did not return a hidden service identifier")
+    return {
+        "service_id": service_id,
+        "onion_address": f"{service_id}.onion",
+        "port": DEFAULT_ONION_PORT,
+    }
 
 
 def _extract_onion_host(value: str) -> str:
@@ -1219,7 +1230,7 @@ def join_room(invitation: str, port: int) -> dict[str, Any]:
     global guest_socket, _peer_count, _active_room, _connection_mode
     authenticated_invite = parse_invite(invitation)
     onion_host = authenticated_invite.onion_address
-    close_room()
+    _require_room_inactive()
     start_tor()
     if not active_socks_port:
         raise RuntimeError("Tor SOCKS port is unavailable")
@@ -1395,23 +1406,46 @@ def close_room() -> dict[str, str]:
 
 
 def build_room_response(room_name: str) -> dict[str, Any]:
+    global active_service_id, active_local_port, listener_thread, listener_socket
     global _active_room, _peer_count, _connection_mode
-    close_room()
-    _reset_crypto()
+    _require_room_inactive()
     try:
-        room = create_hidden_service(room_name)
+        server, local_port = _bind_room_listener()
+        with state_lock:
+            listener_socket = server
+
+        controller = start_tor()
+        room = create_hidden_service(controller, local_port)
+        with state_lock:
+            active_service_id = room["service_id"]
+            active_local_port = local_port
+
+        _reset_crypto()
+        thread = threading.Thread(target=_listener_loop, args=(server,), daemon=True)
+        with state_lock:
+            _active_room = {
+                "mode": "host",
+                "friendly_name": room_name,
+                "onion_address": room["onion_address"],
+                "service_id": room["service_id"],
+                "local_port": local_port,
+                "tor_generation": _tor_generation,
+                "listener_socket": server,
+                "listener_thread": thread,
+            }
+            _connection_mode = "host"
+            _peer_count = 1
+            listener_thread = thread
+            stop_event.clear()
+        thread.start()
+        if not thread.is_alive():
+            raise RuntimeError("Room listener failed to start")
+        invitation = build_invite(room["onion_address"], _public_key_bytes())
     except Exception:
         close_room()
         raise
-    _active_room = {
-        "mode": "host", "friendly_name": room_name, "onion_address": room["onion_address"],
-        "service_id": active_service_id, "local_port": active_local_port,
-        "tor_generation": _tor_generation,
-    }
-    _connection_mode = "host"
-    _peer_count = 1
-    invitation = build_invite(room["onion_address"], _public_key_bytes())
     return {
+        "status": "ready",
         "friendly_name": room_name,
         "onion_address": room["onion_address"],
         "share_link": invitation,
@@ -1435,11 +1469,23 @@ def poll_messages() -> dict[str, Any]:
         events_pending = len(_inbox)
     with state_lock:
         tor_status, tor_error = _tor_runtime_status_locked()
+        host_listener_active = bool(
+            _connection_mode == "host"
+            and _active_room is not None
+            and listener_socket is not None
+            and listener_thread is not None
+            and _active_room.get("listener_socket") is listener_socket
+            and _active_room.get("listener_thread") is listener_thread
+            and _active_room.get("service_id") == active_service_id
+            and _active_room.get("local_port") == active_local_port
+            and listener_thread.is_alive()
+        )
         tor_route_active = bool(
             tor_status == "ready"
             and _active_room is not None
             and _active_room.get("tor_generation") == _tor_generation
             and _connection_mode in {"host", "guest"}
+            and (_connection_mode == "guest" or host_listener_active)
         )
         channel_status = _channel_status
         encrypted = (
@@ -1495,8 +1541,6 @@ def handle_json_command(payload: dict[str, Any]) -> dict[str, Any]:
             start_tor()
             tor_status, tor_error = _tor_runtime_status()
             return {"status": tor_status, "tor_status": tor_status, "tor_error": tor_error}
-        if command == "start_listening":
-            return start_listening()
         if command == "join_room":
             address = str(payload.get("onion_address", payload.get("message", "")))
             try:

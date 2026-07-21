@@ -173,11 +173,22 @@ class BackendTestCase(unittest.TestCase):
         controller.is_alive.return_value = True
         process = mock.MagicMock()
         process.poll.return_value = None
+        server = mock.MagicMock()
+        thread = mock.MagicMock()
+        thread.is_alive.return_value = True
         backend.tor_controller = controller
         backend.tor_process = process
+        backend.active_service_id = "service-id"
+        backend.active_local_port = 12345
+        backend.listener_socket = server
+        backend.listener_thread = thread
         backend._connection_mode = "host"
         backend._active_room = {
             "mode": "host",
+            "service_id": "service-id",
+            "local_port": 12345,
+            "listener_socket": server,
+            "listener_thread": thread,
             "tor_generation": backend._tor_generation,
         }
 
@@ -188,6 +199,38 @@ class BackendTestCase(unittest.TestCase):
         stale = backend.poll_messages()
         self.assertEqual("ready", stale["tor_status"])
         self.assertFalse(stale["tor_route_active"])
+
+    def test_host_route_requires_ownership_of_a_live_listener(self):
+        controller = mock.MagicMock()
+        controller.is_alive.return_value = True
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        server = mock.MagicMock()
+        thread = mock.MagicMock()
+        thread.is_alive.return_value = True
+        backend.tor_controller = controller
+        backend.tor_process = process
+        backend.active_service_id = "service-id"
+        backend.active_local_port = 12345
+        backend.listener_socket = server
+        backend.listener_thread = thread
+        backend._connection_mode = "host"
+        backend._active_room = {
+            "mode": "host",
+            "service_id": "service-id",
+            "local_port": 12345,
+            "listener_socket": mock.MagicMock(),
+            "listener_thread": thread,
+            "tor_generation": backend._tor_generation,
+        }
+
+        unowned = backend.poll_messages()
+        self.assertFalse(unowned["tor_route_active"])
+
+        backend._active_room["listener_socket"] = server
+        thread.is_alive.return_value = False
+        stopped = backend.poll_messages()
+        self.assertFalse(stopped["tor_route_active"])
 
     @mock.patch.object(backend.Controller, "from_port")
     @mock.patch.object(backend.stem.process, "launch_tor_with_config")
@@ -912,25 +955,212 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(backend.MAX_ERROR_MESSAGE_CHARS, len(result))
         self.assertTrue(result.endswith("…"))
 
+    def test_bind_room_listener_closes_socket_when_bind_fails(self):
+        server = mock.MagicMock()
+        server.bind.side_effect = OSError("address unavailable")
+
+        with mock.patch.object(backend.socket, "socket", return_value=server):
+            with self.assertRaisesRegex(OSError, "address unavailable"):
+                backend._bind_room_listener()
+
+        server.close.assert_called_once()
+
+    def test_hidden_service_maps_the_already_bound_listener_port(self):
+        controller = mock.MagicMock()
+        controller.create_ephemeral_hidden_service.return_value.service_id = "service-id"
+
+        room = backend.create_hidden_service(controller, 12345)
+
+        controller.create_ephemeral_hidden_service.assert_called_once_with(
+            {backend.DEFAULT_ONION_PORT: "127.0.0.1:12345"},
+            await_publication=True,
+        )
+        self.assertEqual("service-id.onion", room["onion_address"])
+
+    @mock.patch.object(backend.threading, "Thread")
     @mock.patch.object(backend, "create_hidden_service")
-    @mock.patch.object(backend, "close_room")
-    def test_room_creation_sets_host_state(self, close_room, create_hidden_service):
+    @mock.patch.object(backend, "start_tor")
+    @mock.patch.object(backend, "_bind_room_listener")
+    def test_room_creation_sets_host_state_only_after_listener_starts(
+        self,
+        bind_room_listener,
+        start_tor,
+        create_hidden_service,
+        thread_factory,
+    ):
+        order = []
+        server = mock.MagicMock()
+        controller = mock.MagicMock()
+        controller.is_alive.return_value = True
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        thread = thread_factory.return_value
+        thread.is_alive.return_value = True
+        bind_room_listener.side_effect = lambda: (order.append("bind") or (server, 12345))
+        def start_fresh_tor():
+            order.append("tor")
+            backend.active_service_id = None
+            backend.active_local_port = None
+            backend.tor_controller = controller
+            backend.tor_process = process
+            backend._tor_generation += 1
+            return controller
+
+        start_tor.side_effect = start_fresh_tor
         create_hidden_service.return_value = {
+            "service_id": "service-id",
             "onion_address": "a" * 56 + ".onion",
             "port": backend.DEFAULT_ONION_PORT,
         }
-        backend.active_service_id = "service-id"
-        backend.active_local_port = 12345
+        create_hidden_service.side_effect = lambda *_args: (
+            order.append("onion") or {
+                "service_id": "service-id",
+                "onion_address": "a" * 56 + ".onion",
+                "port": backend.DEFAULT_ONION_PORT,
+            }
+        )
+        thread.start.side_effect = lambda: order.append("listener")
 
         response = backend.build_room_response("test-room")
 
-        close_room.assert_called_once()
+        self.assertEqual(["bind", "tor", "onion", "listener"], order)
         self.assertEqual("host", backend._connection_mode)
         self.assertEqual(1, backend._peer_count)
         self.assertEqual(backend._tor_generation, backend._active_room["tor_generation"])
+        self.assertIs(server, backend._active_room["listener_socket"])
+        self.assertIs(thread, backend._active_room["listener_thread"])
+        self.assertEqual(12345, backend.active_local_port)
+        self.assertEqual("ready", response["status"])
+        self.assertTrue(backend.poll_messages()["tor_route_active"])
         self.assertEqual("test-room", response["friendly_name"])
         self.assertTrue(response["share_link"].startswith("mutinychat://join?"))
         self.assertNotIn("key_b64", response)
+
+    @mock.patch.object(backend, "start_tor")
+    @mock.patch.object(backend, "_bind_room_listener", side_effect=OSError("bind failed"))
+    def test_room_creation_bind_failure_returns_no_invitation(
+        self,
+        _bind_room_listener,
+        start_tor,
+    ):
+        result = backend.handle_json_command({"cmd": "create_room", "name": "test-room"})
+
+        self.assertEqual({"error": "bind failed"}, result)
+        self.assertNotIn("share_link", result)
+        start_tor.assert_not_called()
+        self.assertIsNone(backend._active_room)
+
+    @mock.patch.object(backend, "_bind_room_listener")
+    def test_room_creation_onion_publication_failure_rolls_back(self, bind_room_listener):
+        server = mock.MagicMock()
+        controller = mock.MagicMock()
+        controller.create_ephemeral_hidden_service.side_effect = RuntimeError(
+            "publication failed"
+        )
+        process = mock.MagicMock()
+        backend.tor_controller = controller
+        backend.tor_process = process
+        bind_room_listener.return_value = (server, 12345)
+
+        with mock.patch.object(backend, "start_tor", return_value=controller):
+            result = backend.handle_json_command({"cmd": "create_room", "name": "test-room"})
+
+        self.assertEqual({"error": "publication failed"}, result)
+        self.assertNotIn("share_link", result)
+        server.close.assert_called_once()
+        controller.close.assert_called_once()
+        process.terminate.assert_called_once()
+        self.assertIsNone(backend._active_room)
+        self.assertIsNone(backend.active_service_id)
+        self.assertIsNone(backend.listener_socket)
+
+    @mock.patch.object(backend.threading, "Thread")
+    @mock.patch.object(backend, "build_invite")
+    @mock.patch.object(backend, "_bind_room_listener")
+    def test_room_creation_listener_thread_failure_rolls_back_onion_and_state(
+        self,
+        bind_room_listener,
+        build_invite,
+        thread_factory,
+    ):
+        server = mock.MagicMock()
+        controller = mock.MagicMock()
+        service_id = "a" * 56
+        controller.create_ephemeral_hidden_service.return_value.service_id = service_id
+        process = mock.MagicMock()
+        backend.tor_controller = controller
+        backend.tor_process = process
+        bind_room_listener.return_value = (server, 12345)
+        thread_factory.return_value.start.side_effect = RuntimeError("thread failed")
+
+        with mock.patch.object(backend, "start_tor", return_value=controller):
+            result = backend.handle_json_command({"cmd": "create_room", "name": "test-room"})
+
+        self.assertEqual({"error": "thread failed"}, result)
+        self.assertNotIn("share_link", result)
+        build_invite.assert_not_called()
+        server.close.assert_called_once()
+        controller.remove_ephemeral_hidden_service.assert_called_once_with(service_id)
+        controller.close.assert_called_once()
+        process.terminate.assert_called_once()
+        self.assertIsNone(backend._active_room)
+        self.assertIsNone(backend.active_service_id)
+        self.assertIsNone(backend.active_local_port)
+        self.assertIsNone(backend.listener_socket)
+        self.assertIsNone(backend.listener_thread)
+
+    @mock.patch.object(backend.threading, "Thread")
+    @mock.patch.object(backend, "_bind_room_listener")
+    def test_room_creation_dead_listener_thread_rolls_back_before_response(
+        self,
+        bind_room_listener,
+        thread_factory,
+    ):
+        server = mock.MagicMock()
+        controller = mock.MagicMock()
+        service_id = "a" * 56
+        controller.create_ephemeral_hidden_service.return_value.service_id = service_id
+        process = mock.MagicMock()
+        backend.tor_controller = controller
+        backend.tor_process = process
+        bind_room_listener.return_value = (server, 12345)
+        thread_factory.return_value.is_alive.return_value = False
+
+        with mock.patch.object(backend, "start_tor", return_value=controller):
+            result = backend.handle_json_command({"cmd": "create_room", "name": "test-room"})
+
+        self.assertEqual({"error": "Room listener failed to start"}, result)
+        self.assertNotIn("share_link", result)
+        controller.remove_ephemeral_hidden_service.assert_called_once_with(service_id)
+        self.assertIsNone(backend._active_room)
+        self.assertIsNone(backend.listener_socket)
+        self.assertIsNone(backend.listener_thread)
+
+    @mock.patch.object(backend, "_reset_crypto")
+    def test_room_creation_rejects_replacing_an_active_room(self, reset_crypto):
+        active_room = {"mode": "host", "onion_address": "a" * 56 + ".onion"}
+        backend._active_room = active_room
+        backend._connection_mode = "host"
+
+        with self.assertRaisesRegex(RuntimeError, "Close the current room"):
+            backend.build_room_response("replacement")
+
+        self.assertIs(active_room, backend._active_room)
+        reset_crypto.assert_not_called()
+
+    @mock.patch.object(backend, "start_tor")
+    def test_join_room_rejects_replacing_an_active_room(self, start_tor):
+        host = PrivateKey.generate()
+        invitation = build_invite("a" * 56 + ".onion", bytes(host.public_key))
+        active_room = {"mode": "host", "onion_address": "b" * 56 + ".onion"}
+        backend._active_room = active_room
+        backend._connection_mode = "host"
+
+        with self.assertRaisesRegex(RuntimeError, "Close the current room"):
+            backend.join_room(invitation, backend.DEFAULT_ONION_PORT)
+
+        self.assertIs(active_room, backend._active_room)
+        start_tor.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@
     writeInvitationToClipboard
   } from "./lib/invitationClipboard.js";
   import { clearLegacyUsernamePreference } from "./lib/usernamePrivacy.js";
+  import { parseRoomCreationResponse } from "./lib/roomCreation.js";
   import { closeRetroAudio, playRetroTone } from "./lib/retroAudio.js";
   import { mapBackendTorState, torBadgeDescription, torBadgeText } from "./lib/torStatus.js";
 
@@ -317,16 +318,10 @@
         roomName: finalName
       });
 
-      const parsed = JSON.parse(String(response));
-      roomName = String(parsed.friendly_name || finalName);
-      onionAddress = String(parsed.onion_address || "");
-      shareLink = String(parsed.share_link || (onionAddress ? `Join ${roomName} -> ${onionAddress}` : ""));
-
-      await invoke("backend_ipc", {
-        command: "start_listening",
-        message: null,
-        roomName: null
-      });
+      const readyRoom = parseRoomCreationResponse(response, finalName);
+      roomName = readyRoom.friendlyName;
+      onionAddress = readyRoom.onionAddress;
+      shareLink = readyRoom.shareLink;
 
       backendStatus = "Room ready";
       applySecurityState({ channel_status: "disconnected" });
