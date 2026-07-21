@@ -28,6 +28,8 @@ jobs:
         with:
           node-version: 20.19.5
           cache: npm
+      - name: Reject tracked backend build artifacts
+        run: npm run check:repository-artifacts
       - run: npm ci
       - run: npm run check:release-policy
       - run: npm run check:supply-chain

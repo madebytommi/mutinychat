@@ -18,6 +18,7 @@
     "check:tauri-csp": "node scripts/check-tauri-csp.mjs",
     "check:release-policy": "node scripts/check-release-version.mjs && node scripts/check-release-policy.mjs",
     "check:release-version": "node scripts/check-release-version.mjs",
+    "check:repository-artifacts": "node scripts/check-repository-artifacts.mjs",
     "check:supply-chain": "node scripts/check-supply-chain-pins.mjs",
     "test:packaged:macos": "./scripts/test-packaged-macos.sh",
     "tauri": "tauri"
