@@ -1,0 +1,110 @@
+# Every exception is transitive, has no compatible upstream fix, and expires so
+# the dependency must be reassessed. Do not add an exception for a fixable
+# advisory merely to make CI pass.
+
+# Tauri 2 currently depends on the GTK3 Rust bindings on Linux. These RustSec
+# advisories report that the crates are unmaintained and provide no fixed
+# version. MutinyChat does not depend on their APIs directly.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0413"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0416"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0412"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0418"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0411"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0417"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0414"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0415"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0420"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0419"
+ignoreUntil = 2026-10-20
+reason = "Linux-only transitive GTK3 crate required by Tauri 2; unmaintained advisory has no fixed version"
+
+# The affected VariantStrIter methods are not called by MutinyChat. Tauri's
+# Linux GTK3 dependency requires glib 0.18, so 0.20 is not compatible.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+ignoreUntil = 2026-10-20
+reason = "Affected glib VariantStrIter API is unused and Tauri's GTK3 stack cannot yet accept the fixed release"
+
+# This is an unmaintained build-time procedural macro dependency. It has no
+# patched version and is not present in the packaged runtime.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive build-time macro with no fixed version; not present in packaged runtime"
+
+# urlpattern (through tauri-utils) still uses the unmaintained unic crates.
+# These are maintenance notices with no known vulnerability or fixed version.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0081"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive urlpattern data crate with no fixed version or reported vulnerability"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0075"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive urlpattern data crate with no fixed version or reported vulnerability"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0080"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive urlpattern data crate with no fixed version or reported vulnerability"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0100"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive urlpattern data crate with no fixed version or reported vulnerability"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0098"
+ignoreUntil = 2026-10-20
+reason = "Unmaintained transitive urlpattern data crate with no fixed version or reported vulnerability"
+
+# Tauri's plist dependency pins quick-xml below 0.41. plist 1.8 uses the plain
+# Reader, does not inspect XML attributes, and does not use NsReader, so neither
+# affected path is reachable. Reassess as soon as plist accepts quick-xml 0.41.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0194"
+ignoreUntil = 2026-10-20
+reason = "Tauri plist parser does not inspect attributes and cannot yet accept quick-xml 0.41"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0195"
+ignoreUntil = 2026-10-20
+reason = "Tauri plist parser uses Reader rather than affected NsReader and cannot yet accept quick-xml 0.41"

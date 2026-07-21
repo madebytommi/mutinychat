@@ -166,9 +166,10 @@ Before creating a release tag, update every application manifest to the same sem
 ```bash
 npm run check:release-policy
 npm run check:supply-chain
+bash scripts/run-dependency-audit.sh
 ```
 
-GitHub Actions are pinned to full commit SHAs, Node.js, Python, Rust, and GnuPG use exact versions, npm installs from its integrity-checked lockfile, Cargo runs with its checked-in lockfile, and Python installs require matching hashes.
+GitHub Actions are pinned to full commit SHAs, Node.js, Python, Rust, and GnuPG use exact versions, npm installs from its integrity-checked lockfile, Cargo runs with its checked-in lockfile, and Python installs require matching hashes. CI and release builds also run a checksum-pinned OSV Scanner against the npm, Cargo, and Python lock inputs. Any temporary advisory exception must explain why the affected path is not reachable or why no compatible fix exists, and must include an expiration date.
 
 To verify a downloaded release artifact against GitHub's provenance record and then its checksum:
 
@@ -187,6 +188,7 @@ The Windows workflow checks:
 - Absence of unexpected external frontend runtime resources
 - Consistent application and release versions
 - Immutable GitHub Action and Python package references
+- Known dependency vulnerability scan with expiring reviewed exceptions
 - Python compilation and unit tests
 - Self-contained backend CLI ping
 - Backend stdio JSON ping
@@ -225,11 +227,14 @@ These steps are required before calling a release fully verified. They are not m
 
 - Windows builds are unsigned and may trigger SmartScreen.
 - GitHub provenance attestations depend on GitHub Actions, GitHub's OIDC identity, and the repository workflow remaining trustworthy; they are not a substitute for Authenticode signing with a separately protected publisher key.
+- The application does not independently sign or re-hash its bundled backend and Tor files at every launch. A hash embedded in the same unsigned, user-writable installation would not provide an independent trust anchor; meaningful runtime provenance still requires platform code signing and protection of the installed application directory.
 - CI cannot prove two-peer Tor connectivity on separate machines.
 - First-contact identity still requires the two people to compare the safety code through a separate trusted channel; the app cannot automatically know a person's real-world identity.
 - The cryptographic and networking design has not received an independent professional audit.
 - Unexpected termination may leave temporary Tor data until the operating system cleans its temporary directory.
 - Closing a room clears application-held references and visible history, but Python, Rust, WebView, operating-system swap, and crash-dump memory are not securely zeroized.
+- Direct Tor use can be visible to the local network or internet provider. MutinyChat does not configure bridges or pluggable transports for censorship circumvention.
+- MutinyChat's supported privacy model is the Tauri desktop application. Mobile packages and a standalone browser deployment are not implemented or supported.
 - Copying an invitation is explicit and warns that the clipboard is shared operating-system state. MutinyChat tries to clear that exact value after 60 seconds or when the room closes, but clipboard history, synchronization, or another application may retain it.
 - The application remains a two-person prototype rather than a general-purpose group messenger.
 
@@ -238,6 +243,7 @@ These steps are required before calling a release fully verified. They are not m
 - No central chat server is used by design.
 - Retro sound effects are generated locally; MutinyChat does not load sound effects from Mixkit or another third-party service.
 - Removing third-party sound requests does not mean every application network flow is automatically protected by Tor.
+- MutinyChat binds Tor's control and SOCKS listeners to loopback, authenticates control access with SAFECOOKIE, and uses fresh SOCKS credentials with `IsolateSOCKSAuth` for each join. Those SOCKS credentials isolate streams; they do not prevent another process under the same operating-system account from using a discovered local SOCKS port.
 - An authenticated invitation detects a host-key mismatch, while the safety-code comparison detects full invitation substitution when users compare it through an independent trusted channel.
 - Never confirm a safety code without actually comparing it with the intended participant. A user who blindly confirms can still accept an attacker.
 - Verification applies only to the current ephemeral session and does not create a persistent identity or contact record.
