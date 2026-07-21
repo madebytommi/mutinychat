@@ -1,6 +1,7 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import packageMetadata from "../package.json";
   import {
     channelBadgeText,
     mapBackendSecurityState,
@@ -25,6 +26,8 @@
   import { mapBackendTorState, torBadgeDescription, torBadgeText } from "./lib/torStatus.js";
 
   /** @typedef {{ id: number, text: string, isMine: boolean, sender: string }} ChatMessage */
+
+  const APP_VERSION = packageMetadata.version;
 
   let friendName = $state("Friend Name");
   let myUsername = $state("You");
@@ -1042,7 +1045,7 @@
     </div>
 
     <!-- App version indicator -->
-    <span class="app-version position-absolute small text-muted" aria-label="version">v0.1.0</span>
+    <span class="app-version position-absolute small text-muted" aria-label="version">v{APP_VERSION}</span>
   </section>
 
   <!-- Modal: Create Room -->

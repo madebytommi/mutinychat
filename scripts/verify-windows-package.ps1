@@ -13,6 +13,11 @@ $PortableRoot = Join-Path $Output "MutinyChat-portable"
 $ResourceRoot = Join-Path $Root "src-tauri\resources"
 $PreparedTorDirectory = Join-Path $ResourceRoot "tor"
 $PreparedDataDirectory = Join-Path $ResourceRoot "data"
+$TauriConfig = Get-Content -LiteralPath (Join-Path $Root "src-tauri\tauri.conf.json") -Raw | ConvertFrom-Json
+$AppVersion = [string]$TauriConfig.version
+if ($AppVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+    throw "Tauri configuration contains an invalid application version: $AppVersion"
+}
 
 function Require-File([string]$Path, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -116,7 +121,7 @@ foreach ($Pattern in $Forbidden) {
     }
 }
 
-$PortableZip = Join-Path $Output "MutinyChat_0.1.0_windows_x86_64_portable.zip"
+$PortableZip = Join-Path $Output "MutinyChat_${AppVersion}_windows_x86_64_portable.zip"
 Compress-Archive -Path (Join-Path $PortableRoot "*") -DestinationPath $PortableZip -CompressionLevel Optimal
 Require-File $PortableZip "Portable ZIP"
 
